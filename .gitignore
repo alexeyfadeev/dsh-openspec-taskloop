@@ -1,0 +1,68 @@
+# --- Dependencies ---------------------------------------------------------
+node_modules/
+jspm_packages/
+.pnp
+.pnp.js
+.pnp.cjs
+.yarn/cache/
+.yarn/install-state.gz
+.yarn/unplugged/
+
+# Environment files (NESSY_CLI_DP_AUTH_TOKEN, NESSY_CLI_E2E_SA_KEY, DP_TOKEN, ...)
+.env
+.env.*
+!.env.example
+
+# --- Logs ----------------------------------------------------------------
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# --- Test, coverage and report output ------------------------------------
+coverage/
+.nyc_output/
+*.lcov
+test-results/
+test-report.xml
+junit.xml
+*.tap
+reports/
+
+# --- Build output and caches ---------------------------------------------
+dist/
+build/
+out/
+*.tsbuildinfo
+.npm/
+.eslintcache
+.stylelintcache
+.cache/
+.tmp/
+.temp/
+tmp/
+
+# --- Editors and OS ------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# --- Local agent/editor scratch (docs/ is tracked, these are not) ---------
+*.orig
+*.rej
+*.bak
