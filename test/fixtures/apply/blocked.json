@@ -1,0 +1,35 @@
+{
+  "changeName": "demo",
+  "changeDir": "C:\\projects\\demo\\blocked\\openspec\\changes\\demo",
+  "schemaName": "spec-driven",
+  "contextFiles": {
+    "proposal": [
+      "C:\\projects\\demo\\blocked\\openspec\\changes\\demo\\proposal.md"
+    ],
+    "specs": [
+      "C:\\projects\\demo\\blocked\\openspec\\changes\\demo\\specs\\openspec-taskloop\\spec.md"
+    ],
+    "design": [
+      "C:\\projects\\demo\\blocked\\openspec\\changes\\demo\\design.md"
+    ]
+  },
+  "progress": {
+    "total": 0,
+    "complete": 0,
+    "remaining": 0
+  },
+  "tasks": [],
+  "taskTrackingConfigured": true,
+  "state": "blocked",
+  "missingArtifacts": [
+    "tasks"
+  ],
+  "missingPrerequisites": [
+    "tasks"
+  ],
+  "instruction": "Cannot apply this change yet. Missing artifacts: tasks.\nCreate it with `openspec instructions tasks --change demo` (`openspec status --change demo` shows what is left).",
+  "root": {
+    "path": "C:\\projects\\demo\\blocked",
+    "source": "nearest"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "changes": [
+    {
+      "name": "refactor-cli",
+      "completedTasks": 0,
+      "totalTasks": 3,
+      "lastModified": "2026-10-18T21:40:12.500Z",
+      "status": "in-progress"
+    },
+    {
+      "name": "fix-login-redirect",
+      "completedTasks": 4,
+      "totalTasks": 4,
+      "lastModified": "2026-10-18T21:40:12.500Z",
+      "status": "complete"
+    }
+  ],
+  "root": {
+    "path": "C:\\projects\\demo",
+    "source": "nearest"
+  }
+}

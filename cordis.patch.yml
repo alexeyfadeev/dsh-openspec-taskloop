@@ -1,0 +1,14 @@
+# dsh-openspec-taskloop bundle patch: registers the taskloop plugin row.
+#
+# Mounting (the same shape the neighbouring host-only plugins ship):
+#
+#   dsh plugin --profile <name> add <path-to-this-repo>
+#
+# `dsh plugin` installs the package into the profile and, because this package
+# declares `dsh.bundle.patch`, applies this file as the bundle's layer; the row
+# below is what mounts the plugin. The row id `openspec-taskloop` is also the
+# config target: the profile's own cordis.patch.yml can configure or disable it
+# by id without touching this file.
+- insert:
+    - id: openspec-taskloop
+      name: 'dsh-openspec-taskloop'

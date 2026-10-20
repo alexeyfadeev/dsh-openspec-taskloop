@@ -1,0 +1,36 @@
+{
+  "changes": [
+    {
+      "name": "add-billing",
+      "completedTasks": 2,
+      "totalTasks": 7,
+      "lastModified": "2026-10-02T08:15:00.000Z",
+      "status": "in-progress"
+    },
+    {
+      "name": "docs-update",
+      "completedTasks": 0,
+      "totalTasks": 0,
+      "lastModified": "2026-09-11T06:00:00.000Z",
+      "status": "no-tasks"
+    },
+    {
+      "name": "fix-login-redirect",
+      "completedTasks": 4,
+      "totalTasks": 4,
+      "lastModified": "2026-10-18T21:40:12.500Z",
+      "status": "complete"
+    },
+    {
+      "name": "refactor-cli",
+      "completedTasks": 0,
+      "totalTasks": 3,
+      "lastModified": "2026-10-11T05:00:00.000Z",
+      "status": "in-progress"
+    }
+  ],
+  "root": {
+    "path": "C:\\projects\\demo",
+    "source": "nearest"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "changes": [
+    {
+      "name": "add-taskloop-plugin",
+      "completedTasks": 3,
+      "totalTasks": 20,
+      "lastModified": "2026-10-20T12:43:10.120Z",
+      "status": "in-progress"
+    }
+  ],
+  "root": {
+    "path": "C:\\work\\_dsh\\dsh-openspec-taskloop",
+    "source": "nearest"
+  }
+}
