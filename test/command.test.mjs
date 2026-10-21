@@ -202,7 +202,7 @@ test('apply mounts the command through an effect', () => {
   assert.equal(registrations[0].name, 'taskloop')
 })
 
-test('the mounted command answers usage errors and reports that no run is active', () => {
+test('the mounted command answers usage errors and reports that no run is active', async () => {
   const { ctx, registrations } = fakeContext()
   apply(ctx)
   const [{ handler }] = registrations
@@ -211,7 +211,9 @@ test('the mounted command answers usage errors and reports that no run is active
   assert.equal(invalid.kind, 'error')
   assert.ok(invalid.text.includes(USAGE))
 
-  // With no run registry yet, both control forms answer without inventing a run.
-  assert.equal(handler(invocation('stop')).kind, 'success')
-  assert.equal(handler(invocation('status')).kind, 'success')
+  // Mounting registers the command but starts nothing, so both control forms answer
+  // without inventing a run. `stop` answers asynchronously: it waits for the run it
+  // ended to return before it reports where that run was.
+  assert.match((await handler(invocation('stop'))).text, /no run is active/)
+  assert.match((await handler(invocation('status'))).text, /no run is active/)
 })

@@ -16,7 +16,15 @@ import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { APPLY_ERROR, ApplyError, NEXT_TASK, parseApplyInstructions, RUN_STATE, selectNextTask } from '../lib/tasks.js'
+import {
+  APPLY_ERROR,
+  ApplyError,
+  NEXT_TASK,
+  findListedTask,
+  parseApplyInstructions,
+  RUN_STATE,
+  selectNextTask,
+} from '../lib/tasks.js'
 
 const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'apply')
 
@@ -157,6 +165,23 @@ test('picks the first uncompleted task rather than the first task', () => {
   assert.equal(selection.kind, NEXT_TASK.task)
   assert.equal(selection.task.description, '1.2 Open')
   assert.equal(selection.task.line, 6)
+})
+
+test('a sent task is found again by file, line and text, whatever its checkbox says', () => {
+  const sent = { id: '5', description: '2.3 Do', done: false, sourcePath: 'C:/p/tasks.md', line: 12 }
+
+  // The checkbox is the answer the loop is looking for, so a ticked row still
+  // has to be recognised as the same task.
+  const after = parseApplyInstructions(documentOf({ tasks: [{ ...sent, done: true }] }))
+  assert.equal(findListedTask(after, sent)?.done, true)
+
+  // A row that moved is not the same task even when the text is identical: the
+  // run cannot tell whether the tick belongs to it, so it stops instead.
+  const moved = parseApplyInstructions(documentOf({ tasks: [{ ...sent, line: 13 }] }))
+  assert.equal(findListedTask(moved, sent), undefined)
+
+  const rewritten = parseApplyInstructions(documentOf({ tasks: [{ ...sent, description: '2.3 Do more' }] }))
+  assert.equal(findListedTask(rewritten, sent), undefined)
 })
 
 test('rejects output that is not a usable document', () => {
