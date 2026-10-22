@@ -1,10 +1,15 @@
-// Tests for the configuration contract (task 1.2).
+// Tests for the configuration contract (tasks 1.1–1.3).
 //
 // The point of this file is the "defaults match design.md" claim: the documented
-// block in D11 is parsed out of the change's design.md and compared with the
-// resolved `Config({})`. A changed default that is not documented — or a doc
-// block that no longer describes the code — fails here, so the number in the
-// design cannot silently diverge from the number the plugin uses.
+// block in D11 is parsed out of the base change's design.md, every later change
+// may add a `<!-- config-defaults -->` block with the keys it introduces, and the
+// merge is compared with the resolved `Config({})`. A changed default that is not
+// documented — or a doc block that no longer describes the code — fails here, so
+// the number in the design cannot silently diverge from the number the plugin uses.
+//
+// Fields added by D12 are volatile: the resolved config holds `Volatile`
+// references, so the comparisons unwrap them first and a separate test pins that
+// the new fields really are references rather than plain values.
 
 import assert from 'node:assert/strict'
 import { readdirSync, readFileSync } from 'node:fs'
@@ -12,9 +17,67 @@ import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { Config, resolveConfig } from '../lib/config.js'
+import { COMMIT_TOOLS, resolveConfig } from '../lib/config.js'
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+
+/** Marks a ```json block that documents the config keys a change adds. */
+const CONFIG_DEFAULTS_MARKER = '<!-- config-defaults -->'
+
+/** Shared symbol protocol of cosmokit volatile references (no import: transitive dep). */
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+
+/**
+ * Tell a volatile config reference from a plain resolved value.
+ *
+ * @param {unknown} value - resolved config value.
+ * @returns {boolean} whether `value` is a `Volatile` reference.
+ */
+function isVolatileRef(value) {
+  return typeof value === 'object' && value !== null && VOLATILE_WRITE in value
+}
+
+/**
+ * Unwrap every volatile reference in a resolved config so it can be compared with
+ * the plain JSON documented in design.md.
+ *
+ * @param {unknown} value - resolved config value, possibly containing references.
+ * @returns {unknown} the same shape with each reference replaced by its snapshot.
+ */
+function plain(value) {
+  if (isVolatileRef(value)) return plain(value.get())
+  if (Array.isArray(value)) return value.map(plain)
+  if (isPlainObject(value)) {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, plain(item)]))
+  }
+  return value
+}
+
+/**
+ * @param {unknown} value - candidate value.
+ * @returns {boolean} whether `value` is a non-array object.
+ */
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Overlay the defaults a later decision documents onto the base contract.
+ *
+ * @param {object} base - accumulated defaults.
+ * @param {object} addition - keys added by one `config-defaults` block.
+ * @returns {object} merged defaults; nested objects are merged, not replaced.
+ */
+function mergeDefaults(base, addition) {
+  const result = { ...base }
+  for (const [key, value] of Object.entries(addition)) {
+    const previous = result[key]
+    result[key] = isPlainObject(previous) && isPlainObject(value)
+      ? mergeDefaults(previous, value)
+      : value
+  }
+  return result
+}
 
 /**
  * Find the design.md that carries decision D11, wherever the change lives now.
@@ -62,17 +125,89 @@ function documentedDefaults(text) {
   return JSON.parse(text.slice(start, end))
 }
 
+/**
+ * Collect the `config-defaults` blocks of every change design doc.
+ *
+ * D11 documents the base contract; a later change records only the keys it adds,
+ * so the defaults stay described once per decision instead of being repeated in
+ * full by every change. The blocks keep working after the change is archived
+ * because the walk covers `archive/` too.
+ *
+ * @returns {object[]} one parsed block per marker, in directory order.
+ */
+function documentedAdditions() {
+  const changesDir = join(repoRoot, 'openspec', 'changes')
+  const blocks = []
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) walk(path)
+      else if (entry.name === 'design.md') blocks.push(...defaultsBlocks(readFileSync(path, 'utf8')))
+    }
+  }
+  walk(changesDir)
+  return blocks
+}
+
+/**
+ * Extract every ```json block that follows a `config-defaults` marker.
+ *
+ * @param {string} text - design.md content.
+ * @returns {object[]} parsed blocks.
+ */
+function defaultsBlocks(text) {
+  const blocks = []
+  let marker = text.indexOf(CONFIG_DEFAULTS_MARKER)
+  while (marker !== -1) {
+    const open = text.indexOf('```json', marker)
+    assert.notEqual(open, -1, `${CONFIG_DEFAULTS_MARKER} is not followed by a \`\`\`json block`)
+    const start = text.indexOf('\n', open) + 1
+    const end = text.indexOf('```', start)
+    assert.notEqual(end, -1, 'a config-defaults ```json block is not closed')
+    blocks.push(JSON.parse(text.slice(start, end)))
+    marker = text.indexOf(CONFIG_DEFAULTS_MARKER, end)
+  }
+  return blocks
+}
+
 test('defaults resolved by the schema equal the ones documented in design.md', () => {
-  assert.deepEqual(resolveConfig(), documentedDefaults(readDesignDoc()))
+  const documented = documentedAdditions().reduce(mergeDefaults, documentedDefaults(readDesignDoc()))
+  assert.deepEqual(plain(resolveConfig()), documented)
 })
 
 test('an absent config block resolves to the same defaults as an empty one', () => {
-  assert.deepEqual(resolveConfig(undefined), resolveConfig({}))
+  assert.deepEqual(plain(resolveConfig(undefined)), plain(resolveConfig({})))
 })
 
 test('a configured change name is kept, the default means "not specified"', () => {
   assert.equal(resolveConfig({}).change, '')
   assert.equal(resolveConfig({ change: 'add-taskloop-plugin' }).change, 'add-taskloop-plugin')
+})
+
+test('commit and review are volatile fields with the documented defaults', () => {
+  const config = resolveConfig()
+
+  // Settings shows and writes only volatile fields, so these three must be
+  // references even when the profile says nothing about them.
+  assert.ok(isVolatileRef(config.commit.enabled), 'commit.enabled must be volatile')
+  assert.ok(isVolatileRef(config.commit.tool), 'commit.tool must be volatile')
+  assert.ok(isVolatileRef(config.review.enabled), 'review.enabled must be volatile')
+
+  assert.equal(config.commit.enabled.get(), true)
+  assert.equal(config.commit.tool.get(), 'git')
+  assert.equal(config.review.enabled.get(), true)
+})
+
+test('both commit tools are accepted, an unknown one is rejected', () => {
+  for (const tool of COMMIT_TOOLS) {
+    assert.equal(resolveConfig({ commit: { tool } }).commit.tool.get(), tool)
+  }
+  assert.equal(resolveConfig({ commit: { enabled: false } }).commit.enabled.get(), false)
+  assert.equal(resolveConfig({ review: { enabled: false } }).review.enabled.get(), false)
+
+  // The offending path is part of the error, as it is for `onFailure`.
+  assert.throws(() => resolveConfig({ commit: { tool: 'hg' } }), /commit\.tool/)
+  assert.throws(() => resolveConfig({ commit: { tool: 'Git' } }), /commit\.tool/)
 })
 
 test('both exhaustion policies are accepted, anything else is rejected', () => {

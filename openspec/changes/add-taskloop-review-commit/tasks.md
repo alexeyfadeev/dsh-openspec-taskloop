@@ -2,7 +2,7 @@
 
 ## 1. Конфигурация
 
-- [ ] 1.1 Добавить в `Config` volatile-поля `commit.enabled`, `commit.tool` (`git` | `gitbutler`), `review.enabled` и убедиться, что `test/config.test.mjs` покрывает значения по умолчанию, допустимые значения `tool` и отказ на неизвестном инструменте
+- [x] 1.1 Добавить в `Config` volatile-поля `commit.enabled`, `commit.tool` (`git` | `gitbutler`), `review.enabled` и убедиться, что `test/config.test.mjs` покрывает значения по умолчанию, допустимые значения `tool` и отказ на неизвестном инструменте
 - [ ] 1.2 Перевести существующие `compaction.midTask`, `compaction.onFailure` и `protocol.systemSection` в `.volatile()` и проверить тестом, что дефолты не изменились, а обычные значения из профиля по-прежнему принимаются
 - [ ] 1.3 Перевести чтения на `.get()` (`onFailure` — при старте прогона, `midTask` и `systemSection` — при сборке гейта и секции, `commit.tool` — в момент коммита) и поправить `resolveConfig` под уже разрешённый конфиг с обёртками; проверить тестом с подставным volatile, что изменённое значение видно следующему вызову без пересоздания плагина
 
