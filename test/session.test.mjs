@@ -134,11 +134,39 @@ test('the first task of the new group is sent through prompt, and idleness waits
 
   assert.deepEqual(events, ['prompt', 'idle'])
   assert.equal(controller.prompts.length, 1)
-  assert.deepEqual(controller.prompts[0].request, { sessionId: 'session-2', content: message.content })
+  const request = controller.prompts[0].request
+  // The controller's envelope, not bare content: admission id, queue mode, content.
+  assert.equal(request.sessionId, 'session-2')
+  assert.equal(request.mode, 'queue')
+  assert.equal(typeof request.requestId, 'string')
+  assert.notEqual(request.requestId, '')
+  assert.deepEqual(request.content, message.content)
   // The message is the one the step would have sent in place: the address line
   // still names the change and the exact row the model must tick.
   assert.match(message.content[0].text, /выполни task 3\.1, далее - пауза\./u)
   assert.match(message.content[0].text, /Change: add-taskloop-plugin; файл: .*tasks\.md:17\./u)
+})
+
+test('every prompt carries its own admission id', async () => {
+  const controller = fakeController()
+  const runner = createSessionRunner({
+    controller,
+    sessionId: 'session-2',
+    resolveAgent: () => ({ async whenIdle() {} }),
+  })
+  const message = { role: 'user', content: [{ type: 'text', text: 'task' }] }
+
+  // Two task messages that happen to carry the same text are two admissions, not
+  // one retried request: reusing the id would let the controller deduplicate the
+  // second task away.
+  runner.followup(message)
+  await runner.whenIdle()
+  runner.followup(message)
+  await runner.whenIdle()
+
+  const ids = controller.prompts.map(({ request }) => request.requestId)
+  assert.equal(ids.length, 2)
+  assert.equal(new Set(ids).size, 2)
 })
 
 test('a prompt the controller rejects is reported as a failed turn', async () => {

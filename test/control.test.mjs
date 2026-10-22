@@ -885,7 +885,7 @@ test('a compaction that runs out of attempts stops the run and reports the code'
   assert.equal(result.kind, 'error')
   assert.match(
     result.text,
-    /sent task 2\.3; compaction before task 2\.4 failed after 1 attempt \(summary\); the run stopped and no further task was sent\./,
+    /sent task 2\.3; compaction before task 2\.4 failed after 1 attempt \(summary\): manual compaction failed: summary; the run stopped and no further task was sent\./,
   )
   // Nothing was carried past a stop: the break policy reports the stop alone.
   assert.doesNotMatch(result.text, /Warning:/)
@@ -921,7 +921,7 @@ test('a compaction that runs out of attempts under the continue policy sends the
   assert.match(result.text, /tasks\.md still leaves 2\.4 unchecked/)
   assert.match(
     result.text,
-    /Warning: compaction before task 2\.4 failed after 1 attempt \(busy\); the run continued without compaction\./,
+    /Warning: compaction before task 2\.4 failed after 1 attempt \(busy\): manual compaction failed: busy; the run continued without compaction\./,
   )
   assert.equal(messages.length, 2)
   assert.equal(cli.calls.length, 4)
@@ -956,7 +956,7 @@ test('several survived compactions are reported together under the continue poli
   assert.equal(compactions, 2)
   assert.match(
     result.text,
-    /Warnings: compaction before task .+ failed after 1 attempt \(busy\); compaction before task .+ failed after 1 attempt \(summary\); the run continued without compaction\./,
+    /Warnings: compaction before task .+ failed after 1 attempt \(busy\): manual compaction failed: busy; compaction before task .+ failed after 1 attempt \(summary\): manual compaction failed: summary; the run continued without compaction\./,
   )
   assert.equal(messages.length, 3)
   assert.equal(cli.calls.length, 5)

@@ -644,6 +644,7 @@ test('a failed compaction stops the run under the break policy', async () => {
       attempts: 3,
       delays: [1000, 2000],
       code: 'summary',
+      error: new Error('manual compaction failed: summary'),
     }),
   })
 
@@ -652,6 +653,9 @@ test('a failed compaction stops the run under the break policy', async () => {
   assert.equal(outcome.task.line, 12)
   assert.equal(outcome.compaction.attempts, 3)
   assert.equal(outcome.compaction.code, 'summary')
+  // The backend's own sentence rides along: a code is a category, and a failed
+  // compaction without one still has a reason the report must be able to name.
+  assert.equal(outcome.compaction.reason, 'manual compaction failed: summary')
   // The withheld task is named by the outcome, and it never reached the session.
   assert.equal(outcome.compaction.task.line, 13)
   // A stop is the whole answer: nothing was carried past the failed compaction.

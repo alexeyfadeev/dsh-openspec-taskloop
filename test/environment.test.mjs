@@ -211,7 +211,10 @@ test('the new session is created in the run workspace and driven through the con
   await runner.whenIdle()
 
   assert.equal(prompts.length, 1)
-  assert.deepEqual(prompts[0].request, { sessionId: 'session-2', content: [{ type: 'text', text: 'task' }] })
+  assert.equal(prompts[0].request.sessionId, 'session-2')
+  assert.equal(prompts[0].request.mode, 'queue')
+  assert.equal(typeof prompts[0].request.requestId, 'string')
+  assert.deepEqual(prompts[0].request.content, [{ type: 'text', text: 'task' }])
   // The invocation's own cancellation travels with the prompt; `/taskloop stop`
   // aborts the run's signal, not the command's, so a stopped run does not kill
   // the turn it started.
@@ -330,6 +333,98 @@ test('a session runner is traced back to its live agent before compacting', asyn
   await environment.compactNow({ sessionId: 'session-2', followup() {}, whenIdle() {} }, undefined)
 
   assert.deepEqual(calls, [live])
+})
+
+test('a preset-isolated profile compacts through the preset registry', async () => {
+  // The shipped `dsh-web-app` profile disables the host-plane compaction row and
+  // mounts a private one inside each preset's group. The host-plane lookup answers
+  // nothing there, and the registry is the public route to the instance the agent
+  // actually runs with (6.1).
+  const calls = []
+  const resolved = []
+  const agent = { id: 'agent-1', ctx: { name: 'agent' }, runMaintenance() {} }
+  const compaction = {
+    async compactNow(target, signal) {
+      calls.push({ target, signal })
+      return null
+    },
+  }
+  const ctx = fakeCtx({
+    agentPresets: {
+      serviceFor(target, name) {
+        resolved.push({ target, name })
+        return compaction
+      },
+    },
+  })
+  const environment = createEnvironment(ctx, resolveConfig())
+  const signal = new AbortController().signal
+
+  const result = await environment.compactNow(agent, signal)
+
+  assert.equal(result, null)
+  assert.deepEqual(resolved, [{ target: agent, name: 'compaction' }])
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].target, agent)
+  assert.equal(calls[0].signal, signal)
+})
+
+test('a host-plane compaction wins over the preset one', async () => {
+  const hostCalls = []
+  const host = {
+    async compactNow() {
+      hostCalls.push('host')
+      return null
+    },
+  }
+  const agent = { id: 'agent-1', ctx: {}, runMaintenance() {} }
+  const ctx = fakeCtx({
+    compaction: host,
+    agentPresets: {
+      serviceFor() {
+        throw new Error('the preset service must not be asked when the host plane has one')
+      },
+    },
+  })
+  const environment = createEnvironment(ctx, resolveConfig())
+
+  await environment.compactNow(agent, undefined)
+
+  assert.deepEqual(hostCalls, ['host'])
+})
+
+test('a step compaction falls back to the preset service as well', async () => {
+  const calls = []
+  const agent = { id: 'agent-1', ctx: {} }
+  const compaction = {
+    async compactIfNeeded(target, trigger, signal) {
+      calls.push({ target, trigger, signal })
+      return null
+    },
+  }
+  const ctx = fakeCtx({ agentPresets: { serviceFor: () => compaction } })
+  const environment = createEnvironment(ctx, resolveConfig())
+  const signal = new AbortController().signal
+
+  const result = await environment.compactIfNeeded(agent, signal)
+
+  assert.equal(result, null)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].target, agent)
+  assert.equal(calls[0].trigger, 'pressure')
+  assert.equal(calls[0].signal, signal)
+})
+
+test('a registry without serviceFor is the same as no service at all', async () => {
+  const environment = createEnvironment(
+    fakeCtx({ agentPresets: { composedPreset: () => 'cordis' } }),
+    resolveConfig(),
+  )
+
+  await assert.rejects(
+    () => environment.compactNow({ id: 'agent-1', runMaintenance() {} }, undefined),
+    /compaction service is not composed/,
+  )
 })
 
 test('a deployment without a compaction service cannot compact', async () => {
