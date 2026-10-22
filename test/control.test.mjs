@@ -263,6 +263,81 @@ test('a checked task advances the run to the next one', async () => {
   assert.equal(cli.calls.length, 4)
 })
 
+test('a run outlives the request that started it, and its report lands in the session', async () => {
+  // The user's tab goes away — a reload, a closed window, a dropped socket — while
+  // the task is still running. The host aborts the invocation's signal at that
+  // moment. The run must keep driving: finish 2.3, compact, send 2.4.
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(progressedApply()),
+  ])
+  const request = new AbortController()
+  const appended = []
+  let finishTurn
+  const turn = new Promise((resolve) => {
+    finishTurn = resolve
+  })
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    agent: {
+      session: {
+        append(type, message, options) {
+          appended.push({ type, message, options })
+        },
+      },
+      whenIdle: () => turn,
+    },
+  })
+
+  const running = control.run(
+    { ...invocation(agent), signal: request.signal },
+    { change: null },
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(messages.length, 1, 'the first task was sent before the request ended')
+
+  request.abort()
+  finishTurn()
+  const result = await running
+
+  // The run did not stop at 2.3: it read the file again and sent the next task.
+  assert.equal(messages.length, 2)
+  assert.match(messages[1].content[0].text, /выполни task 2\.4/u)
+  // The command result has no reader any more, so the report is appended to the
+  // session as a notice: same sentences, a channel the user still has.
+  assert.equal(appended.length, 1)
+  assert.equal(appended[0].type, 'user/message')
+  assert.deepEqual(appended[0].options, { surfaceOp: 'append' })
+  assert.equal(appended[0].message.source.kind, 'runtime-context')
+  assert.equal(appended[0].message.source.form, 'notice')
+  assert.equal(appended[0].message.content[0].text, result.text)
+  assert.match(result.text, /sent tasks 2\.3 and 2\.4/u)
+})
+
+test('a live request keeps the report as the command result and appends nothing', async () => {
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(progressedApply()),
+  ])
+  const appended = []
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    agent: {
+      session: { append: (...args) => appended.push(args) },
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.match(result.text, /sent tasks 2\.3 and 2\.4/u)
+  assert.equal(messages.length, 2)
+  assert.deepEqual(appended, [], 'the user reads the report as the command result')
+})
+
 test('a run that crosses a group boundary continues in a new session and names it', async () => {
   // 2.3 and 2.4 are ticked by their turns; 3.1 opens group 3 and runs elsewhere.
   const both = tickedApply([12, 13])

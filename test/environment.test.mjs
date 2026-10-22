@@ -222,6 +222,38 @@ test('the new session is created in the run workspace and driven through the con
   assert.deepEqual(idled, ['session'])
 })
 
+test('a session opened at a boundary is driven with the run signal, not the request one', async () => {
+  // The request's signal dies with the request; a session that continues the work
+  // must not inherit that cancellation, or a reload would cancel the turn the new
+  // group just started.
+  const prompts = []
+  const request = new AbortController().signal
+  const run = new AbortController().signal
+  const controller = {
+    async create() {
+      return { sessionId: 'session-2' }
+    },
+    prompt(request_, signal) {
+      prompts.push({ request: request_, signal })
+      return Promise.resolve({ messageId: 'm-1' })
+    },
+  }
+  const environment = createEnvironment(
+    fakeCtx({ sessionController: controller, agents: { get: () => ({ async whenIdle() {} }) } }),
+    resolveConfig(),
+  )
+
+  const runner = await environment.openSession(
+    { agent: agentWith(), signal: request },
+    { change: 'add-taskloop-plugin', cwd: '/work/demo', signal: run },
+  )
+  runner.followup({ role: 'user', content: [{ type: 'text', text: 'task' }] })
+  await runner.whenIdle()
+
+  assert.equal(prompts.length, 1)
+  assert.equal(prompts[0].signal, run)
+})
+
 test('the session opened at a boundary hands its agent to the run', async () => {
   const sessionAgent = { async whenIdle() {} }
   const adopted = []

@@ -2,9 +2,11 @@
 //
 // The slot is what makes "one active run per process" true: a second start meets
 // the run that already owns the slot instead of getting a second one, and a stop is
-// a signal the loop watches rather than a flag it may notice later. Both are pinned
-// here without a loop or a CLI, because the guarantees belong to the handle a run is
-// given — the loop's own reaction is covered in `test/loop.test.mjs`.
+// a signal the loop watches rather than a flag it may notice later. The handle also
+// owns the run's lifetime: the request that started it can end at any moment, and
+// the run does not. All of that is pinned here without a loop or a CLI, because the
+// guarantees belong to the handle a run is given — the loop's own reaction is
+// covered in `test/loop.test.mjs`.
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
@@ -68,14 +70,19 @@ test('stop aborts the run and records who asked', () => {
   assert.equal(run.stopped, true)
 })
 
-test("the run's signal follows the invocation's own cancellation", () => {
-  const invocation = new AbortController()
-  const { run } = createRuns().start('add-a', invocation.signal)
+test('the run ignores the request that started it', () => {
+  // The invocation's signal belongs to the UI request: the host aborts it when the
+  // response connection closes (a reloaded tab, a closed window), which says nothing
+  // about the run. Only `/taskloop stop` ends a run from outside.
+  const request = new AbortController()
+  const { run } = createRuns().start('add-a')
 
-  invocation.abort()
+  request.abort()
 
+  assert.equal(run.signal.aborted, false, 'a request that ends does not end the run')
+  run.stop()
   assert.equal(run.signal.aborted, true)
-  assert.equal(run.stopped, false, 'the run was cancelled, not stopped by the command')
+  assert.equal(run.stopped, true, 'the run was stopped by the command, not cancelled by a request')
 })
 
 test('a run settles only when it is finished', async () => {
