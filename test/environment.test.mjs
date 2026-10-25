@@ -1,17 +1,24 @@
-// Tests for the Cordis-facing seam (tasks 3.1–3.3, 5.1, 6.1, 6.3).
+// Tests for the Cordis-facing seam (tasks 3.1–3.3, 4.2, 5.1–5.3, 6.1, 6.3).
 //
 // The seam is small but decisive: which directory `openspec` runs in, which
 // timeout the wrapper gets, whether the confirmation, the description question
 // and the explore follow-up reach the session's services, which services open
-// the session a run continues in at a group boundary, and what the two compaction
-// calls send to the service. A fake context exposes exactly the services the seam
+// the session a run continues in at a group boundary, what the two compaction
+// calls send to the service, where the commit message text comes from, whether it
+// is kept and how it is dropped again (design D16), and which argv the commit tool
+// is started with (4.2). A fake context exposes exactly the services the seam
 // reads, so a lookup of the wrong service fails here instead of in a mounted
 // profile.
 
 import assert from 'node:assert/strict'
+import { access, mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
 
 import { INIT_ANSWER, INIT_LABEL, INIT_QUESTION_ID } from '../lib/bootstrap.js'
+import { COMMIT_END, runCommit } from '../lib/commit.js'
+import { COMMIT_MESSAGE_QUESTION_ID, COMMIT_TEXT } from '../lib/commit-text.js'
 import { resolveConfig } from '../lib/config.js'
 import { createEnvironment, resolveCwd } from '../lib/environment.js'
 import {
@@ -21,6 +28,7 @@ import {
   buildExplorePrompt,
 } from '../lib/explore.js'
 import { OpenSpecCli } from '../lib/openspec.js'
+import { readCommitMessage, stateFileOf, writeCommitMessage } from '../lib/state.js'
 
 /**
  * A context that hands back the composed services and nothing else.
@@ -294,6 +302,39 @@ test('a deployment without a session controller cannot open a session', async ()
   )
 })
 
+test('the review session denies approval prompts on its live agent', async () => {
+  const calls = []
+  const sessionAgent = { id: 'agent-2', async whenIdle() {} }
+  const environment = createEnvironment(fakeCtx({
+    approval: {
+      setPolicy(target, policy) {
+        calls.push({ target, policy })
+      },
+    },
+    agents: { get: (id) => (id === 'session-2' ? sessionAgent : undefined) },
+  }), resolveConfig())
+
+  await environment.setApproval('session-2')
+
+  // The policy goes on the agent of the review session, not on the invocation's:
+  // that is the only session whose unattended turn needs it (task 3.2, design D14).
+  assert.deepEqual(calls, [{ target: sessionAgent, policy: 'never' }])
+})
+
+test('without an approval service there is no one to ask, so nothing is switched', async () => {
+  const environment = createEnvironment(fakeCtx({}), resolveConfig())
+
+  await environment.setApproval('session-2')
+})
+
+test('a review session without a live agent cannot deny approvals', async () => {
+  const environment = createEnvironment(fakeCtx({
+    approval: { setPolicy() {} },
+  }), resolveConfig())
+
+  await assert.rejects(() => environment.setApproval('session-2'), /has no live agent/u)
+})
+
 test('without a workspace the new session is created by the run directory', async () => {
   const created = []
   const ctx = fakeCtx({
@@ -512,4 +553,512 @@ test('a deployment without a compaction service cannot compact a step', async ()
     () => environment.compactIfNeeded({ id: 'agent-1' }, undefined),
     /compaction service is not composed/,
   )
+})
+
+/** A reader whose whole retained text is `text`; the shape collect-mode stdio returns. */
+const reader = (text) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
+
+/**
+ * A handle the commit runner can settle.
+ *
+ * `hang` keeps `done` pending forever, which is how a command the stop cut short is
+ * told apart from one the tool finished itself.
+ *
+ * @param {object} [options]
+ * @param {number|null} [options.exitCode] - exit facts of a finished command.
+ * @param {string} [options.stdout] - collected stdout.
+ * @param {string} [options.stderr] - retained stderr.
+ * @param {boolean} [options.hang] - never settle.
+ * @returns {object} fake process handle.
+ */
+function handleOf({ exitCode = 0, stdout = '', stderr = '', hang = false } = {}) {
+  const handle = {
+    collected: { stdout: reader(stdout), stderr: reader(stderr) },
+    done: hang ? new Promise(() => {}) : Promise.resolve({ exitCode, signal: null }),
+    terminated: 0,
+    terminate() {
+      handle.terminated += 1
+    },
+  }
+  return handle
+}
+
+/**
+ * A fake `ctx.subprocess` that records the executable lookups and the spawn specs.
+ *
+ * @param {object} [options]
+ * @param {string|Error} [options.executable] - resolved path, or the lookup failure.
+ * @param {(spec: object) => object} [options.spawn] - handle factory.
+ * @returns {object} fake subprocess service.
+ */
+function fakeToolSubprocess({ executable = '/usr/local/bin/git', spawn = () => handleOf() } = {}) {
+  const calls = { resolve: [], spawn: [] }
+  return {
+    calls,
+    async resolveExecutable(command, env, signal) {
+      calls.resolve.push({ command, env, signal })
+      if (executable instanceof Error) throw executable
+      return executable
+    },
+    spawn(spec) {
+      calls.spawn.push(spec)
+      return spawn(spec)
+    },
+  }
+}
+
+test('the commit tool is started with the message as one argv element', async () => {
+  const message = 'Добавить эндпоинт. Tasks 2.1 - 2.4'
+  const subprocess = fakeToolSubprocess({
+    executable: 'C:\\Program Files\\Git\\cmd\\git.exe',
+    spawn: () => handleOf({ stdout: '[main 1a2b3c4] Добавить эндпоинт. Tasks 2.1 - 2.4\n 2 files changed\n' }),
+  })
+  const environment = createEnvironment(fakeCtx({ subprocess }), resolveConfig())
+
+  const result = await environment.runCommitCommand(
+    { executable: 'git', args: ['commit', '-m', message] },
+    { cwd: '/work/demo' },
+  )
+
+  assert.equal(subprocess.calls.resolve[0].command, 'git')
+  assert.equal(result.exitCode, 0)
+  assert.match(result.stdout, /\[main 1a2b3c4\]/)
+  assert.equal(result.stderr, '')
+
+  const spec = subprocess.calls.spawn[0]
+  assert.deepEqual(spec.argv, ['C:\\Program Files\\Git\\cmd\\git.exe', 'commit', '-m', message])
+  assert.equal(spec.cwd, '/work/demo')
+  assert.equal(spec.stdio.stdin, 'ignore')
+  assert.ok(spec.graceMs > 0)
+  // Argv only: no command line and no shell, so the host starts exactly these
+  // elements and the message can never be re-split into further words (design D15).
+  assert.equal('shell' in spec, false)
+  assert.equal('command' in spec, false)
+  assert.equal(spec.signal, undefined)
+})
+
+test('punctuation in the message reaches the tool as text', async () => {
+  const message = 'fix: "quotes" & $(rm -rf /) ; echo hi'
+  const subprocess = fakeToolSubprocess()
+  const environment = createEnvironment(fakeCtx({ subprocess }), resolveConfig())
+
+  await environment.runCommitCommand({ executable: 'git', args: ['commit', '-m', message] }, { cwd: '/repo' })
+
+  const spec = subprocess.calls.spawn[0]
+  assert.deepEqual(spec.argv, ['/usr/local/bin/git', 'commit', '-m', message])
+  assert.equal(spec.argv[3], message)
+})
+
+test('a tool that is not on PATH rejects with the command it could not run', async () => {
+  const missing = Object.assign(new Error('spawn git ENOENT'), { name: 'SubprocessExecutableNotFoundError' })
+  const subprocess = fakeToolSubprocess({ executable: missing })
+  const environment = createEnvironment(fakeCtx({ subprocess }), resolveConfig())
+
+  await assert.rejects(
+    () => environment.runCommitCommand({ executable: 'git', args: ['status', '--porcelain'] }, { cwd: '/repo' }),
+    (error) => {
+      assert.match(error.message, /git status cannot run/)
+      assert.match(error.message, /git was not found/)
+      assert.match(error.message, /ENOENT/)
+      return true
+    },
+  )
+  assert.equal(subprocess.calls.spawn.length, 0)
+})
+
+test('a spawn failure is reported with the command that could not start', async () => {
+  const subprocess = fakeToolSubprocess({
+    spawn() {
+      throw new Error('EMFILE: too many open files')
+    },
+  })
+  const environment = createEnvironment(fakeCtx({ subprocess }), resolveConfig())
+
+  await assert.rejects(
+    () => environment.runCommitCommand({ executable: 'git', args: ['add', '-A'] }, { cwd: '/repo' }),
+    /git add could not start: EMFILE/,
+  )
+})
+
+test('the runner refuses a request that is not one command', async () => {
+  const subprocess = fakeToolSubprocess()
+  const environment = createEnvironment(fakeCtx({ subprocess }), resolveConfig())
+
+  await assert.rejects(
+    () => environment.runCommitCommand({ executable: 'git', args: 'commit -m x' }, { cwd: '/repo' }),
+    /requires a request with an executable and an args array/,
+  )
+  assert.equal(subprocess.calls.spawn.length, 0)
+})
+
+test('a refused commit comes back as data, with the tool and its exit code', async () => {
+  // The seam's whole contract in one test: the status check says there is work,
+  // `add` succeeds, `git commit` refuses — and that refusal is an outcome a report
+  // can quote, not an exception that fails the run (design D15/D17).
+  const subprocess = fakeToolSubprocess({
+    spawn: (spec) => {
+      if (spec.argv[1] === 'status') return handleOf({ stdout: ' M lib/loop.js\n' })
+      if (spec.argv[1] === 'add') return handleOf()
+      return handleOf({ exitCode: 128, stderr: 'fatal: not a git repository\n' })
+    },
+  })
+  const environment = createEnvironment(fakeCtx({ subprocess }), resolveConfig())
+
+  const outcome = await runCommit({
+    tool: 'git',
+    text: 'Добавить эндпоинт',
+    range: { from: '2.1', to: '2.4' },
+    cwd: '/repo',
+    run: environment.runCommitCommand,
+  })
+
+  assert.equal(outcome.kind, COMMIT_END.failed)
+  assert.equal(outcome.tool, 'git')
+  assert.equal(outcome.message, 'Добавить эндпоинт. Tasks 2.1 - 2.4')
+  assert.equal(outcome.command, 'git commit')
+  assert.equal(outcome.exitCode, 128)
+  assert.match(outcome.reason, /fatal: not a git repository/)
+})
+
+test('a clean tree ends the commit before any command that changes it', async () => {
+  const subprocess = fakeToolSubprocess({ spawn: () => handleOf({ stdout: '\n' }) })
+  const environment = createEnvironment(fakeCtx({ subprocess }), resolveConfig())
+
+  const outcome = await runCommit({
+    tool: 'git',
+    text: 'Добавить эндпоинт',
+    cwd: '/repo',
+    run: environment.runCommitCommand,
+  })
+
+  assert.equal(outcome.kind, COMMIT_END.empty)
+  assert.deepEqual(subprocess.calls.spawn.map((spec) => spec.argv.slice(1)), [['status', '--porcelain']])
+})
+
+test('a stop terminates the tool and ends the commit as stopped, not as a refusal', async () => {
+  const controller = new AbortController()
+  let commitHandle
+  const subprocess = fakeToolSubprocess({
+    spawn: (spec) => {
+      if (spec.argv[1] === 'status') return handleOf({ stdout: ' M lib/loop.js\n' })
+      if (spec.argv[1] === 'add') return handleOf()
+      commitHandle = handleOf({ hang: true })
+      setTimeout(() => controller.abort(), 0)
+      return commitHandle
+    },
+  })
+  const environment = createEnvironment(fakeCtx({ subprocess }), resolveConfig())
+
+  const outcome = await runCommit({
+    tool: 'git',
+    text: 'Добавить эндпоинт',
+    cwd: '/repo',
+    signal: controller.signal,
+    run: environment.runCommitCommand,
+  })
+
+  assert.equal(outcome.kind, COMMIT_END.stopped)
+  // The abandoned wait is made real by terminating the managed process.
+  assert.equal(commitHandle.terminated, 1)
+})
+
+test('a stop that landed before the commit starts runs nothing', async () => {
+  const controller = new AbortController()
+  controller.abort()
+  const subprocess = fakeToolSubprocess()
+  const environment = createEnvironment(fakeCtx({ subprocess }), resolveConfig())
+
+  const outcome = await runCommit({
+    tool: 'gitbutler',
+    text: 'Добавить эндпоинт',
+    cwd: '/repo',
+    signal: controller.signal,
+    run: environment.runCommitCommand,
+  })
+
+  assert.equal(outcome.kind, COMMIT_END.stopped)
+  assert.equal(subprocess.calls.resolve.length, 0)
+  assert.equal(subprocess.calls.spawn.length, 0)
+})
+
+test('a deployment without a subprocess service cannot commit', async () => {
+  const environment = createEnvironment(fakeCtx({}), resolveConfig())
+
+  await assert.rejects(
+    () => environment.runCommitCommand({ executable: 'git', args: ['commit', '-m', 'x'] }, { cwd: '/repo' }),
+    /subprocess service is not composed/,
+  )
+})
+
+/**
+ * An empty directory to use as `profileContext.home`, removed when the test ends.
+ *
+ * @param {object} t - node:test context.
+ * @returns {Promise<string>} path of the temporary harness home.
+ */
+async function temporaryHome(t) {
+  const home = await mkdtemp(join(tmpdir(), 'openspec-taskloop-env-'))
+  t.after(async () => {
+    await rm(home, { recursive: true, force: true })
+  })
+  return home
+}
+
+/**
+ * The answer shape a question service returns for free text.
+ *
+ * @param {string} custom - text the user typed.
+ * @returns {object} the `ctx.userQuestions` answer.
+ */
+const messageAnswer = (custom) => ({ answers: [{ id: COMMIT_MESSAGE_QUESTION_ID, selected: [], custom }] })
+
+test('the stored message of a change is used and the question is not asked', async (t) => {
+  const home = await temporaryHome(t)
+  await writeCommitMessage({ home, cwd: '/repo', change: 'demo', message: 'Добавить эндпоинт' })
+  const questions = {
+    async ask() {
+      throw new Error('the stored text must not be asked for again')
+    },
+  }
+  const environment = createEnvironment(
+    fakeCtx({ profileContext: { home }, userQuestions: questions }),
+    resolveConfig(),
+  )
+
+  const outcome = await environment.commitText(
+    { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+    { change: 'demo', cwd: '/repo' },
+  )
+
+  assert.deepEqual(outcome, { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' })
+})
+
+test('a change without a stored message is asked once and the answer is kept', async (t) => {
+  const home = await temporaryHome(t)
+  const asked = []
+  const questions = {
+    async ask(request) {
+      asked.push(request)
+      return messageAnswer('  Добавить эндпоинт  ')
+    },
+  }
+  const environment = createEnvironment(
+    fakeCtx({ profileContext: { home }, userQuestions: questions }),
+    resolveConfig(),
+  )
+  const invocation = { agent: { id: 'agent-1' }, signal: new AbortController().signal }
+
+  const outcome = await environment.commitText(invocation, { change: 'demo', cwd: '/repo' })
+
+  // Trimmed once, so the run commits with the same string the next run reads back.
+  assert.deepEqual(outcome, { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' })
+  assert.equal(asked.length, 1)
+  assert.equal(asked[0].agent, invocation.agent)
+  assert.equal(asked[0].signal, invocation.signal)
+  assert.equal(asked[0].questions[0].id, COMMIT_MESSAGE_QUESTION_ID)
+  // Stored straight away: a run stopped after this point must not ask again (design D16).
+  assert.equal(await readCommitMessage({ home, cwd: '/repo', change: 'demo' }), 'Добавить эндпоинт')
+
+  // The next run of the same change reads it back instead of asking again.
+  const second = createEnvironment(
+    fakeCtx({
+      profileContext: { home },
+      userQuestions: {
+        async ask() {
+          throw new Error('the second run asked again')
+        },
+      },
+    }),
+    resolveConfig(),
+  )
+  assert.deepEqual(
+    await second.commitText(invocation, { change: 'demo', cwd: '/repo' }),
+    { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' },
+  )
+})
+
+test('a dismissed question is a refusal and stores nothing', async (t) => {
+  const home = await temporaryHome(t)
+  const questions = {
+    async ask() {
+      const error = new Error('dismissed')
+      error.code = 'ASK_CANCELLED'
+      throw error
+    },
+  }
+  const environment = createEnvironment(
+    fakeCtx({ profileContext: { home }, userQuestions: questions }),
+    resolveConfig(),
+  )
+
+  const outcome = await environment.commitText(
+    { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+    { change: 'demo', cwd: '/repo' },
+  )
+
+  assert.deepEqual(outcome, { kind: COMMIT_TEXT.cancelled })
+  // Nothing is kept: the run that would have used the text never started (5.2).
+  assert.equal(await readCommitMessage({ home, cwd: '/repo', change: 'demo' }), undefined)
+  await assert.rejects(() => access(stateFileOf(home)), /ENOENT/)
+})
+
+test('a session with no question channel has no message and writes no state', async (t) => {
+  const home = await temporaryHome(t)
+  const environment = createEnvironment(fakeCtx({ profileContext: { home } }), resolveConfig())
+
+  const outcome = await environment.commitText(
+    { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+    { change: 'demo', cwd: '/repo' },
+  )
+
+  assert.deepEqual(outcome, { kind: COMMIT_TEXT.unavailable })
+  await assert.rejects(() => access(stateFileOf(home)), /ENOENT/)
+})
+
+test('a host without a profile home still asks and uses the answer for the run', async () => {
+  const questions = { async ask() { return messageAnswer('Добавить эндпоинт') } }
+  const environment = createEnvironment(fakeCtx({ userQuestions: questions }), resolveConfig())
+
+  const outcome = await environment.commitText(
+    { agent: { id: 'agent-1' } },
+    { change: 'demo', cwd: '/repo' },
+  )
+
+  // Nowhere documented to keep the text: the run commits with the answer, and the next
+  // one asks again — better than refusing to commit in a host that has no harness home.
+  assert.deepEqual(outcome, { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' })
+})
+
+test('a state file that cannot be read is reported before the question is asked', async (t) => {
+  const home = await temporaryHome(t)
+  // A directory where the file belongs: reading it fails with EISDIR, which is not
+  // "nothing stored" and must not be answered with a question.
+  await mkdir(stateFileOf(home), { recursive: true })
+  const asked = []
+  const questions = {
+    async ask() {
+      asked.push('text')
+      return messageAnswer('Добавить эндпоинт')
+    },
+  }
+  const environment = createEnvironment(
+    fakeCtx({ profileContext: { home }, userQuestions: questions }),
+    resolveConfig(),
+  )
+
+  await assert.rejects(
+    () => environment.commitText(
+      { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+      { change: 'demo', cwd: '/repo' },
+    ),
+    (error) => error.code === 'EISDIR',
+  )
+  assert.deepEqual(asked, [])
+})
+
+test('a finished change drops its text, so the next run asks again', async (t) => {
+  const home = await temporaryHome(t)
+  const asked = []
+  const questions = {
+    async ask() {
+      asked.push('text')
+      return messageAnswer('Добавить эндпоинт')
+    },
+  }
+  const environment = createEnvironment(
+    fakeCtx({ profileContext: { home }, userQuestions: questions }),
+    resolveConfig(),
+  )
+  const invocation = { agent: { id: 'agent-1' }, signal: new AbortController().signal }
+
+  assert.deepEqual(
+    await environment.commitText(invocation, { change: 'demo', cwd: '/repo' }),
+    { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' },
+  )
+  // A second change of the same project keeps its own record across the deletion.
+  await writeCommitMessage({ home, cwd: '/repo', change: 'other', message: 'Починить вход' })
+
+  await environment.forgetCommitText({ change: 'demo', cwd: '/repo' })
+
+  assert.equal(await readCommitMessage({ home, cwd: '/repo', change: 'demo' }), undefined)
+  assert.equal(await readCommitMessage({ home, cwd: '/repo', change: 'other' }), 'Починить вход')
+
+  // The point of dropping it (5.3): the next run of the finished change asks again.
+  const questionsAgain = {
+    async ask() {
+      asked.push('text')
+      return messageAnswer('Следующая задача')
+    },
+  }
+  const next = createEnvironment(
+    fakeCtx({ profileContext: { home }, userQuestions: questionsAgain }),
+    resolveConfig(),
+  )
+  assert.deepEqual(
+    await next.commitText(invocation, { change: 'demo', cwd: '/repo' }),
+    { kind: COMMIT_TEXT.text, text: 'Следующая задача' },
+  )
+  assert.equal(asked.length, 2)
+})
+
+test('dropping the text of a change that has none writes nothing', async (t) => {
+  const home = await temporaryHome(t)
+  const environment = createEnvironment(fakeCtx({ profileContext: { home } }), resolveConfig())
+
+  await environment.forgetCommitText({ change: 'demo', cwd: '/repo' })
+
+  // Cleaning up is not a reason to create the state file (5.3).
+  await assert.rejects(() => access(stateFileOf(home)), /ENOENT/)
+})
+
+test('a host without a profile home has no stored text to drop', async () => {
+  const environment = createEnvironment(fakeCtx({}), resolveConfig())
+
+  // Nowhere documented to keep it, so nothing to remove and nothing to fail on.
+  await environment.forgetCommitText({ change: 'demo', cwd: '/repo' })
+})
+
+test('a commit line is appended to the session that drove the finished group', async () => {
+  const appended = []
+  const agent = {
+    id: 'agent-1',
+    session: {
+      append(type, message, options) {
+        appended.push({ type, message, options })
+      },
+    },
+  }
+  const environment = createEnvironment(fakeCtx({}), resolveConfig())
+  const text = 'taskloop: commit 1a2b3c4 for tasks 2.1 - 2.4 (git).'
+
+  assert.equal(await environment.appendNotice(agent, text), true)
+  assert.equal(appended.length, 1)
+  // A notice, not a turn: the same shape the report of a run outlived by its request
+  // uses, so the transcript shows it and no model turn is started for it.
+  assert.equal(appended[0].type, 'user/message')
+  assert.deepEqual(appended[0].options, { surfaceOp: 'append' })
+  assert.equal(appended[0].message.source.kind, 'runtime-context')
+  assert.equal(appended[0].message.source.form, 'notice')
+  assert.equal(appended[0].message.content[0].text, text)
+})
+
+test('a session runner is traced back to the agent that owns its transcript', async () => {
+  const appended = []
+  const agent = { id: 'session-2-agent', session: { append: (...args) => appended.push(args) } }
+  const environment = createEnvironment(
+    fakeCtx({ agents: { get: (id) => (id === 'session-2' ? agent : undefined) } }),
+    resolveConfig(),
+  )
+
+  assert.equal(await environment.appendNotice({ sessionId: 'session-2' }, 'taskloop: commit 1a2b3c4.'), true)
+  assert.equal(appended.length, 1)
+  assert.equal(appended[0][1].content[0].text, 'taskloop: commit 1a2b3c4.')
+})
+
+test('a session that cannot take a line answers false instead of failing the run', async () => {
+  const environment = createEnvironment(fakeCtx({}), resolveConfig())
+
+  // A runner whose session cannot be resolved, and an agent with no session at all.
+  assert.equal(await environment.appendNotice({ sessionId: 'gone' }, 'taskloop: commit 1a2b3c4.'), false)
+  assert.equal(await environment.appendNotice({ id: 'agent-without-session' }, 'x'), false)
 })

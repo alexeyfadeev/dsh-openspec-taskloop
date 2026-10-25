@@ -9,7 +9,9 @@
 //
 // Fields added by D12 are volatile: the resolved config holds `Volatile`
 // references, so the comparisons unwrap them first and a separate test pins that
-// the new fields really are references rather than plain values.
+// the new fields really are references rather than plain values. The same holds
+// for `compaction.midTask`, `compaction.onFailure` and `protocol.systemSection`,
+// which D12 moved to volatile without changing their defaults or their meaning.
 
 import assert from 'node:assert/strict'
 import { readdirSync, readFileSync } from 'node:fs'
@@ -17,7 +19,13 @@ import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { COMMIT_TOOLS, resolveConfig } from '../lib/config.js'
+import {
+  COMMIT_TOOLS,
+  DEFAULT_MID_TASK,
+  DEFAULT_ON_FAILURE,
+  DEFAULT_PROTOCOL_SYSTEM_SECTION,
+  resolveConfig,
+} from '../lib/config.js'
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -179,6 +187,15 @@ test('an absent config block resolves to the same defaults as an empty one', () 
   assert.deepEqual(plain(resolveConfig(undefined)), plain(resolveConfig({})))
 })
 
+test('an already resolved config is passed through instead of validated again', () => {
+  // `apply` receives the config the loader resolved, so its volatile fields are
+  // references; re-validating that object would reject the very one the plugin
+  // runs against (D12). A raw block still goes through the schema.
+  const resolved = resolveConfig({ compaction: { midTask: true } })
+  assert.equal(resolveConfig(resolved), resolved)
+  assert.equal(resolveConfig(resolved).compaction.midTask.get(), true)
+})
+
 test('a configured change name is kept, the default means "not specified"', () => {
   assert.equal(resolveConfig({}).change, '')
   assert.equal(resolveConfig({ change: 'add-taskloop-plugin' }).change, 'add-taskloop-plugin')
@@ -211,8 +228,8 @@ test('both commit tools are accepted, an unknown one is rejected', () => {
 })
 
 test('both exhaustion policies are accepted, anything else is rejected', () => {
-  assert.equal(resolveConfig({ compaction: { onFailure: 'continue' } }).compaction.onFailure, 'continue')
-  assert.equal(resolveConfig({ compaction: { onFailure: 'break' } }).compaction.onFailure, 'break')
+  assert.equal(resolveConfig({ compaction: { onFailure: 'continue' } }).compaction.onFailure.get(), 'continue')
+  assert.equal(resolveConfig({ compaction: { onFailure: 'break' } }).compaction.onFailure.get(), 'break')
   assert.throws(() => resolveConfig({ compaction: { onFailure: 'retry' } }), /onFailure/)
 })
 
@@ -235,10 +252,33 @@ test('retry values are bounded by the schema', () => {
 
 test('the mid-task gate and the protocol section stay off unless switched on', () => {
   const off = resolveConfig()
-  assert.equal(off.compaction.midTask, false)
-  assert.equal(off.protocol.systemSection, false)
+  assert.equal(off.compaction.midTask.get(), false)
+  assert.equal(off.protocol.systemSection.get(), false)
 
   const on = resolveConfig({ compaction: { midTask: true }, protocol: { systemSection: true } })
-  assert.equal(on.compaction.midTask, true)
-  assert.equal(on.protocol.systemSection, true)
+  assert.equal(on.compaction.midTask.get(), true)
+  assert.equal(on.protocol.systemSection.get(), true)
+})
+
+test('the pre-existing compaction and protocol fields are volatile too (D12)', () => {
+  const config = resolveConfig()
+
+  // Moving these three to volatile must not change what they mean: the values
+  // are still the documented defaults, only read through a reference now.
+  assert.ok(isVolatileRef(config.compaction.onFailure), 'compaction.onFailure must be volatile')
+  assert.ok(isVolatileRef(config.compaction.midTask), 'compaction.midTask must be volatile')
+  assert.ok(isVolatileRef(config.protocol.systemSection), 'protocol.systemSection must be volatile')
+
+  assert.equal(config.compaction.onFailure.get(), DEFAULT_ON_FAILURE)
+  assert.equal(config.compaction.midTask.get(), DEFAULT_MID_TASK)
+  assert.equal(config.protocol.systemSection.get(), DEFAULT_PROTOCOL_SYSTEM_SECTION)
+
+  // Plain values from a profile stay valid and are still what the reference reads.
+  const configured = resolveConfig({
+    compaction: { onFailure: 'continue', midTask: true },
+    protocol: { systemSection: true },
+  })
+  assert.equal(configured.compaction.onFailure.get(), 'continue')
+  assert.equal(configured.compaction.midTask.get(), true)
+  assert.equal(configured.protocol.systemSection.get(), true)
 })

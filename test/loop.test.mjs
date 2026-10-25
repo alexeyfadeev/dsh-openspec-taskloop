@@ -14,7 +14,7 @@ import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import { COMPACTION_END, ON_FAILURE } from '../lib/compaction.js'
-import { LOOP_END, runLoop } from '../lib/loop.js'
+import { GROUP_END, LOOP_END, runLoop } from '../lib/loop.js'
 
 const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'apply')
 
@@ -127,6 +127,47 @@ function completedDocument() {
   document.state = 'all_done'
   document.progress = { total: 20, complete: 20, remaining: 0 }
   document.instruction = 'All tracked tasks are complete.'
+  return JSON.stringify(document)
+}
+
+/**
+ * A document with every checkbox but one ticked, as it reads just before that
+ * task's turn — the run has a single task left to send.
+ *
+ * @param {number} line - row to leave unchecked.
+ * @returns {string} JSON text of the document.
+ */
+function documentWithOnly(line) {
+  const document = JSON.parse(fixture('ready.json'))
+  for (const task of document.tasks) task.done = task.line !== line
+  document.progress = { total: 20, complete: 19, remaining: 1 }
+  return JSON.stringify(document)
+}
+
+/**
+ * The given document with every checkbox ticked, in whatever numbering it has.
+ *
+ * @param {string} text - document to complete.
+ * @returns {string} JSON text of the completed document.
+ */
+function completedIn(text) {
+  const document = JSON.parse(text)
+  for (const task of document.tasks) task.done = true
+  document.state = 'all_done'
+  document.progress = { total: 20, complete: 20, remaining: 0 }
+  return JSON.stringify(document)
+}
+
+/**
+ * The given document with every checkbox but one ticked, leaving its counts alone.
+ *
+ * @param {string} text - document to change.
+ * @param {number} line - row to leave unchecked.
+ * @returns {string} JSON text of the document.
+ */
+function onlyLineUndone(text, line) {
+  const document = JSON.parse(text)
+  for (const task of document.tasks) task.done = task.line !== line
   return JSON.stringify(document)
 }
 
@@ -761,4 +802,202 @@ test('a stop that lands during compaction ends the run as cancelled', async () =
   assert.equal(outcome.kind, LOOP_END.cancelled)
   assert.deepEqual(outcome.sent.map((task) => task.line), [12])
   assert.equal(messages.length, 1)
+})
+
+test('a completed intermediate group is announced before the next group is opened', async () => {
+  // 2.3 and 2.4 are the remainder of group 2; once both are ticked the group is
+  // whole and group 3 must start in a session of its own.
+  const both = tickedDocument([12, 13])
+  const { events, agent, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(progressedDocument()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const completed = []
+
+  const outcome = await loop({
+    onGroupComplete: async (context) => {
+      completed.push(context)
+      events.push('group')
+      return { kind: GROUP_END.closed }
+    },
+    openSession: async () => {
+      events.push('open')
+      return {
+        sessionId: 'session-2',
+        followup(message) {
+          events.push(`prompt ${labelOf(message)}`)
+        },
+        async whenIdle() {
+          events.push('session idle')
+        },
+      }
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  // One announcement, and it names the whole group, not just the task that closed it.
+  assert.equal(completed.length, 1)
+  assert.equal(completed[0].change, CHANGE)
+  assert.deepEqual(completed[0].tasks.map((task) => task.line), [10, 11, 12, 13])
+  assert.deepEqual(completed[0].range, { from: '2.1', to: '2.4' })
+  // The group names the recipient that drove it, so an action taken at the boundary
+  // (the commit, 4.3) can speak in the session whose transcript the group is in.
+  assert.equal(completed[0].agent, agent)
+  // The break between 2.3 and 2.4 is not a group end, and the announcement comes
+  // after verification but before the next group's session exists (design D13).
+  assert.deepEqual(events, [
+    'read',
+    'followup 2.3',
+    'idle',
+    'read',
+    'followup 2.4',
+    'idle',
+    'read',
+    'group',
+    'open',
+    'prompt 3.1',
+    'session idle',
+    'read',
+  ])
+})
+
+test('a group the run reached by a handoff is announced with the session that drove it', async () => {
+  // Group 2 closes in the invocation's session; group 3 closes in the session the run
+  // moved to at the boundary. The hook must name that runner rather than the original
+  // agent: it is the session whose transcript holds the group, and therefore the one a
+  // commit taken at the boundary can speak in (4.3).
+  const { loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(tickedDocument([12])),
+    cliResult(tickedDocument([12, 13])),
+    cliResult(tickedDocument([12, 13, 17])),
+    cliResult(tickedDocument([12, 13, 17, 18])),
+    cliResult(tickedDocument([12, 13, 17, 18, 19])),
+  ])
+  const completed = []
+  const runner = {
+    sessionId: 'session-2',
+    followup() {},
+    async whenIdle() {},
+  }
+
+  const outcome = await loop({
+    onGroupComplete: (context) => {
+      completed.push(context)
+      // Stop at the second boundary: the test is about which recipient it names,
+      // not about the run that would follow it.
+      return completed.length === 2
+        ? { kind: GROUP_END.commit, commit: { tool: 'git', message: 'stop here' } }
+        : { kind: GROUP_END.closed }
+    },
+    openSession: async () => runner,
+  })
+
+  assert.equal(outcome.kind, LOOP_END.commit)
+  assert.equal(completed.length, 2)
+  assert.equal(completed[0].agent.id, 'agent-1')
+  assert.equal(completed[1].agent, runner)
+})
+
+test('a completed final group is announced before the run settles as complete', async () => {
+  // Only 7.1 is left, so the turn that ticks it closes group 7 — a group with no
+  // following task, which is exactly what the announcement must not depend on.
+  const { events, loop } = harness([
+    cliResult(documentWithOnly(40)),
+    cliResult(completedDocument()),
+  ])
+  const completed = []
+
+  const outcome = await loop({
+    onGroupComplete: (context) => {
+      completed.push(context)
+      events.push('group')
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.completed)
+  assert.equal(completed.length, 1)
+  assert.deepEqual(completed[0].tasks.map((task) => task.line), [40, 41, 42])
+  assert.deepEqual(completed[0].range, { from: '7.1', to: '7.3' })
+  assert.deepEqual(events, ['read', 'followup 7.1', 'idle', 'read', 'group'])
+})
+
+test('a flat run is announced once at the end, with no task range', async () => {
+  // A flat list has no groups: the whole set closes together, and only when every
+  // checkbox is ticked (design D13).
+  const flat = flatDocument()
+  const { loop } = harness([
+    cliResult(onlyLineUndone(flat, 5)),
+    cliResult(completedIn(flat)),
+  ])
+  const completed = []
+
+  const outcome = await loop({
+    onGroupComplete: (context) => completed.push(context),
+  })
+
+  assert.equal(outcome.kind, LOOP_END.completed)
+  assert.equal(completed.length, 1)
+  assert.equal(completed[0].tasks.length, 20)
+  assert.equal(completed[0].range, undefined)
+  assert.equal('range' in completed[0], false)
+})
+
+test('an unchecked task announces no completed group', async () => {
+  // The group is complete only when `tasks.md` says so; a task left unchecked stops
+  // the run before any review could be due.
+  const { loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(fixture('ready.json')),
+  ])
+  const completed = []
+
+  const outcome = await loop({
+    onGroupComplete: (context) => completed.push(context),
+  })
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.deepEqual(completed, [])
+})
+
+test('a commit the group hook could not close stops the run at the boundary', async () => {
+  // 2.4's turn completes group 2, and the commit that follows the review is refused by
+  // the tool. The group is ticked off, the history did not move, so the run may not
+  // carry on into group 3 (4.3, design D15/D17).
+  const both = tickedDocument([12, 13])
+  const { messages, events, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(progressedDocument()),
+    cliResult(both),
+  ])
+  const failure = {
+    kind: 'failed',
+    tool: 'git',
+    message: 'Добавить эндпоинт. Tasks 2.1 - 2.4',
+    command: 'git commit',
+    exitCode: 128,
+    reason: 'fatal: not a git repository',
+    range: { from: '2.1', to: '2.4' },
+  }
+
+  const outcome = await loop({
+    onGroupComplete: async (context) => {
+      events.push('group')
+      return { kind: GROUP_END.commit, commit: failure }
+    },
+    openSession: async () => {
+      events.push('open')
+      throw new Error('the session of group 3 must not be opened after a failed commit')
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.commit)
+  // The hook's account travels unchanged: the loop does not interpret what the tool said.
+  assert.deepEqual(outcome.commit, failure)
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12, 13])
+  // Nothing followed the group: no reading, no session for 3.1, no message.
+  assert.deepEqual(events, ['read', 'followup 2.3', 'idle', 'read', 'followup 2.4', 'idle', 'read', 'group'])
+  assert.equal(messages.length, 2)
 })

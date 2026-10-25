@@ -14,6 +14,7 @@ import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import { INIT_ARGS, INIT_ANSWER } from '../lib/bootstrap.js'
+import { COMMIT_TEXT } from '../lib/commit-text.js'
 import { resolveConfig } from '../lib/config.js'
 import { createControl } from '../lib/control.js'
 import { EXPLORE_ANSWER, EXPLORE_SKILL_PATH, sendExplorePrompt } from '../lib/explore.js'
@@ -80,6 +81,30 @@ function flatApply() {
   for (const task of document.tasks) {
     task.description = task.description.replace(/^\d+\.\d+ /u, '')
   }
+  return JSON.stringify(document)
+}
+
+/**
+ * Two tasks of the captured document, without their numbers, ticked as asked.
+ *
+ * A flat run has no groups, so the whole listed set is the unit the loop announces
+ * (design D13): two tasks are enough to reach that moment, and the document stays
+ * small enough to follow through the readings of one test.
+ *
+ * @param {number[]} done - lines that are ticked.
+ * @returns {string} JSON text of the document.
+ */
+function twoTaskFlat(done) {
+  const document = JSON.parse(applyFixture('ready.json'))
+  document.tasks = document.tasks.filter((task) => task.line === 12 || task.line === 13)
+  for (const task of document.tasks) {
+    task.description = task.description.replace(/^\d+\.\d+ /u, '')
+    task.done = done.includes(task.line)
+  }
+  document.progress = { total: 2, complete: done.length, remaining: 2 - done.length }
+  // The CLI is what decides the run is over; a ready document with nothing left
+  // unchecked is `idle` (design D4), not a completed change.
+  document.state = done.length === 2 ? 'all_done' : 'ready'
   return JSON.stringify(document)
 }
 
@@ -163,9 +188,14 @@ function recordingPrompt() {
  * @param {Function} [options.openSession] - way to open the session a new group runs in.
  * @param {Function} [options.compactNow] - one compaction call for the session a task runs in (6.1).
  * @param {Function} [options.compactIfNeeded] - one step-boundary compaction call (6.3).
- * @returns {{control: object, asked: object[], descriptions: object[], messages: object[], agent: object}}
+ * @param {Function} [options.setApproval] - approval narrowing of a review session (3.3).
+ * @param {Function} [options.runCommitCommand] - runner of the commit tool (4.2/4.3).
+ * @param {Function} [options.commitText] - message text source of this change's commits (4.3).
+ * @param {Function} [options.forgetCommitText] - dropping the stored text of a finished change (5.3).
+ * @returns {{control: object, asked: object[], descriptions: object[], messages: object[], approvals: string[], agent: object, forgotten: object[]}}
  *   the control, the initialisation questions, the description questions, the
- *   follow-up messages and the agent that received them.
+ *   follow-up messages, the sessions whose approvals were narrowed, the agent
+ *   that received the tasks, and the changes whose stored message was dropped.
  */
 function harness({
   createCli,
@@ -176,10 +206,17 @@ function harness({
   openSession,
   compactNow,
   compactIfNeeded,
+  setApproval,
+  runCommitCommand,
+  commitText,
+  forgetCommitText,
+  appendNotice,
 }) {
   const asked = []
   const descriptions = []
   const messages = []
+  const approvals = []
+  const forgotten = []
   const agent = {
     id: 'agent-1',
     followup(message) {
@@ -207,8 +244,19 @@ function harness({
     openSession,
     compactNow,
     compactIfNeeded,
+    setApproval: async (sessionId) => {
+      approvals.push(sessionId)
+      await setApproval?.(sessionId)
+    },
+    runCommitCommand,
+    commitText,
+    appendNotice,
+    forgetCommitText: async (context) => {
+      forgotten.push(context)
+      await forgetCommitText?.(context)
+    },
   })
-  return { control, asked, descriptions, messages, agent }
+  return { control, asked, descriptions, messages, approvals, agent, forgotten }
 }
 
 /** An invocation shaped like the registry's. */
@@ -352,6 +400,9 @@ test('a run that crosses a group boundary continues in a new session and names i
   const sessionMessages = []
   const { control, messages, agent } = harness({
     createCli: () => cli,
+    // The review that closes group 2 is a session of its own (3.3) and has its own
+    // tests; here it would only add a second `openSession()` to count.
+    config: { review: { enabled: false } },
     openSession: async (invocation, context) => {
       opened.push({ invocation, context })
       return {
@@ -380,6 +431,609 @@ test('a run that crosses a group boundary continues in a new session and names i
   assert.equal(messages.length, 2)
   assert.equal(sessionMessages.length, 1)
   assert.match(sessionMessages[0].content[0].text, /выполни task 3\.1, далее - пауза\./u)
+})
+
+test('a finished group is reviewed in a session of its own before the next group opens one', async () => {
+  // 2.4's turn completes group 2, and the review settles before the loop selects
+  // 3.1 — which is the moment the session of group 3 is opened (design D13). The
+  // two sessions therefore cannot be the same one.
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const opened = []
+  const sent = []
+  const { control, messages, agent, approvals } = harness({
+    createCli: () => cli,
+    openSession: async (invocation, context) => {
+      // A review asks for its session by the work it will do; a boundary asks for
+      // the session that takes over from `previous` at `task`.
+      const sessionId = context.range === undefined ? 'session-2' : 'review-1'
+      opened.push({ sessionId, context })
+      return {
+        sessionId,
+        followup(message) {
+          sent.push({ sessionId, message })
+        },
+        async whenIdle() {},
+      }
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.deepEqual(opened.map((entry) => entry.sessionId), ['review-1', 'session-2'])
+  assert.equal(opened[0].context.change, 'add-taskloop-plugin')
+  assert.deepEqual(opened[0].context.range, { from: '2.1', to: '2.4' })
+  // The review borrows the opener but not the run's task machinery: neither the
+  // protocol section nor the step gate describes a one-turn review.
+  assert.equal('adoptAgent' in opened[0].context, false)
+  assert.equal('adoptAgent' in opened[1].context, true)
+  // Unattended: the policy is narrowed before the instruction enters the session.
+  assert.deepEqual(approvals, ['review-1'])
+  // One instruction, naming the change and the group. The run waits for the review
+  // turn, so the next task leaves only after the review session went idle.
+  assert.equal(sent.length, 2)
+  assert.match(
+    sent[0].message.content[0].text,
+    /Проведи код-ревью .*change "add-taskloop-plugin" \(задачи 2\.1 - 2\.4\), далее - пауза\./u,
+  )
+  assert.equal(sent[1].sessionId, 'session-2')
+  assert.match(sent[1].message.content[0].text, /выполни task 3\.1/u)
+  assert.equal(messages.length, 2, 'the task messages stayed in the session the run started in')
+  // Both ids reach the report: the review session is a place the user never watched.
+  assert.match(result.text, /The review of tasks 2\.1 - 2\.4 ran in session review-1\./u)
+  assert.match(result.text, /The run moved to session session-2 \(task 3\.1\) at the group boundary\./u)
+})
+
+test('a flat list is reviewed once, at the end of the run, by one instruction', async () => {
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(twoTaskFlat([])),
+    cliResult(twoTaskFlat([12])),
+    cliResult(twoTaskFlat([12, 13])),
+  ])
+  const opened = []
+  const reviews = []
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    openSession: async (invocation, context) => {
+      opened.push(context)
+      return {
+        sessionId: 'review-1',
+        followup(message) {
+          reviews.push(message)
+        },
+        async whenIdle() {},
+      }
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /all tracked tasks are complete/u)
+  assert.equal(messages.length, 2)
+  // No numbering, no range: the instruction names the whole list instead (D13).
+  assert.equal(opened.length, 1)
+  assert.equal('range' in opened[0], false)
+  assert.equal(reviews.length, 1)
+  assert.match(reviews[0].content[0].text, /\(весь список задач\)/u)
+  assert.match(result.text, /The review of the whole task list ran in session review-1\./u)
+})
+
+test('a stop during the review ends the run and sends the next task to nobody', async () => {
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(twoTaskFlat([])),
+    cliResult(twoTaskFlat([12])),
+    cliResult(twoTaskFlat([12, 13])),
+  ])
+  let reviewSent
+  const reviewArrived = new Promise((resolve) => {
+    reviewSent = resolve
+  })
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    openSession: async () => ({
+      sessionId: 'review-1',
+      followup() {
+        reviewSent()
+      },
+      // Never settles on its own: the stop is what ends the wait.
+      whenIdle: () => new Promise(() => {}),
+    }),
+  })
+
+  const running = control.run(invocation(agent), { change: null })
+  await reviewArrived
+  const stopped = await control.stop()
+  const result = await running
+
+  assert.match(stopped.text, /stopped the run for change "add-taskloop-plugin" on task/u)
+  assert.match(stopped.text, /no further task was sent\./u)
+  assert.match(result.text, /the run was stopped by \/taskloop stop/u)
+  // The review did not finish, so the report says so instead of claiming one.
+  assert.match(result.text, /The review of the whole task list was stopped in session review-1\./u)
+  assert.equal(messages.length, 2, 'the task after the review was never sent')
+  assert.equal(cli.calls.length, 4, 'no reading followed the stopped review')
+})
+
+test('review off means a finished group is not reviewed and the run completes', async () => {
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(twoTaskFlat([])),
+    cliResult(twoTaskFlat([12])),
+    cliResult(twoTaskFlat([12, 13])),
+  ])
+  const opened = []
+  const { control, agent } = harness({
+    createCli: () => cli,
+    config: { review: { enabled: false } },
+    openSession: async (invocation, context) => {
+      opened.push(context)
+      return { sessionId: 'session-2', followup() {}, async whenIdle() {} }
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  assert.doesNotMatch(result.text, /The review of/u)
+  assert.deepEqual(opened, [])
+})
+
+test('a review that cannot open a session is an error, not a silent skip', async () => {
+  // A deployment that composes no session opener cannot review a group, and the
+  // review is required behaviour: the run says so instead of completing as if the
+  // group had been checked.
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(twoTaskFlat([])),
+    cliResult(twoTaskFlat([12])),
+    cliResult(twoTaskFlat([12, 13])),
+  ])
+  const { control, messages, agent } = harness({ createCli: () => cli })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /the review of a finished group cannot open a session/u)
+  assert.equal(messages.length, 2)
+})
+
+/**
+ * Build the exit facts of one commit request that succeeded.
+ *
+ * @param {string} [stdout] - what the tool printed.
+ * @returns {object} a settled request result.
+ */
+const toolOk = (stdout = '') => ({ exitCode: 0, stdout, stderr: '' })
+
+/**
+ * Build the exit facts of a commit request the tool refused.
+ *
+ * @param {number} exitCode - code the request exited with.
+ * @param {object} [streams] - `stdout`/`stderr` overrides.
+ * @returns {object} a settled request result.
+ */
+const toolNo = (exitCode, { stdout = '', stderr = '' } = {}) => ({ exitCode, stdout, stderr })
+
+/**
+ * A fake commit tool that answers by request name and records what it was asked.
+ *
+ * The runner is the environment's (4.2), so these tests see exactly what the plugin
+ * would spawn: an argv array and a directory, never a command line.
+ *
+ * @param {object} answers - settled results by request name, e.g. `{ 'git status': … }`.
+ * @param {string[]} [events] - shared ordering log, to pin when the tool ran (4.3).
+ * @returns {object} the runner with a `calls` log.
+ */
+function scriptedCommitTool(answers, events = []) {
+  const calls = []
+  return {
+    calls,
+    async run(request, options) {
+      const name = [request.executable, request.args[0]].join(' ')
+      calls.push({ name, request, options })
+      events.push(name)
+      const next = answers[name]
+      if (next === undefined) throw new Error(`unexpected commit request: ${name}`)
+      return next
+    },
+  }
+}
+
+test('a finished group is committed after its review, with the message as one argument', async () => {
+  // 2.4's turn completes group 2, so the review and then the commit settle before the
+  // loop selects 3.1 (design D13): the review's fixes are in the tree this commit takes.
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const events = []
+  const tool = scriptedCommitTool({
+    'git status': toolOk(' M lib/control.js\n?? lib/commit.js\n'),
+    'git add': toolOk(),
+    'git commit': toolOk('[main 1a2b3c4] Добавить эндпоинт. Tasks 2.1 - 2.4\n 2 files changed, 40 insertions(+)\n'),
+  }, events)
+  const { control, agent } = harness({
+    createCli: () => cli,
+    commitText: async (invocation, context) => {
+      events.push('text')
+      assert.equal(context.change, 'add-taskloop-plugin')
+      assert.equal(context.cwd, CWD)
+      return { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }
+    },
+    runCommitCommand: tool.run,
+    openSession: async (invocation, context) => {
+      events.push(context.range === undefined ? 'open group' : 'open review')
+      return {
+        sessionId: context.range === undefined ? 'session-2' : 'review-1',
+        followup() {},
+        async whenIdle() {},
+      }
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  // The text is settled before the first turn (5.2), the group is reviewed, and only
+  // then does the tree get committed.
+  assert.deepEqual(events, ['text', 'open review', 'git status', 'git add', 'git commit', 'open group'])
+  // One argv element: no shell can split the message, and the range is the group's.
+  assert.deepEqual(tool.calls[2].request.args, ['commit', '-m', 'Добавить эндпоинт. Tasks 2.1 - 2.4'])
+  assert.equal(tool.calls[0].options.cwd, CWD)
+  // The tool's own line is quoted: that is where the commit id is (design D17).
+  assert.match(result.text, /The review of tasks 2\.1 - 2\.4 ran in session review-1\./u)
+  assert.match(
+    result.text,
+    /The commit of tasks 2\.1 - 2\.4 through git went through: \[main 1a2b3c4\] Добавить эндпоинт\. Tasks 2\.1 - 2\.4\./u,
+  )
+})
+
+test('the session that drove the group gets the commit id as soon as the tool commits', async () => {
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk(' M lib/control.js\n'),
+    'git add': toolOk(),
+    'git commit': toolOk('[main 1a2b3c4] Добавить эндпоинт. Tasks 2.1 - 2.4\n 2 files changed, 40 insertions(+)\n'),
+  })
+  const notices = []
+  const { control, agent } = harness({
+    createCli: () => cli,
+    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    runCommitCommand: tool.run,
+    appendNotice: async (recipient, text) => {
+      notices.push({ recipient, text })
+      return true
+    },
+    openSession: async (invocation, context) => ({
+      sessionId: context.range === undefined ? 'session-2' : 'review-1',
+      followup() {},
+      async whenIdle() {},
+    }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  // The run itself stops on 3.1 (the scripted CLI never ticks it); what this test
+  // pins is the line the commit left behind on its way out (4.3).
+  assert.match(result.text, /The commit of tasks 2\.1 - 2\.4 through git went through/u)
+  // The line lands in the group's own transcript, addressed to the recipient that
+  // drove it (4.3): the report is read wherever the work went next, and until it
+  // arrives this is the only place the id can be found.
+  assert.deepEqual(notices.map((entry) => entry.text), ['taskloop: commit 1a2b3c4 for tasks 2.1 - 2.4 (git).'])
+  assert.equal(notices[0].recipient, agent)
+})
+
+test('the commit line quotes the tool when its output names no id', async () => {
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk('M lib/control.js\n'),
+    'git add': toolOk(),
+    'git commit': toolOk('committed the tree\n'),
+  })
+  const notices = []
+  const { control, agent } = harness({
+    createCli: () => cli,
+    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    runCommitCommand: tool.run,
+    appendNotice: async (recipient, text) => {
+      notices.push({ recipient, text })
+      return true
+    },
+    openSession: async (invocation, context) => ({
+      sessionId: context.range === undefined ? 'session-2' : 'review-1',
+      followup() {},
+      async whenIdle() {},
+    }),
+  })
+
+  await control.run(invocation(agent), { change: null })
+
+  // No hash is invented: the sentence says what did happen and quotes the tool.
+  assert.deepEqual(notices.map((entry) => entry.text), [
+    'taskloop: the commit of tasks 2.1 - 2.4 through git went through: committed the tree.',
+  ])
+})
+
+test('a commit line that cannot be appended leaves the finished run a success', async () => {
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk('M lib/control.js\n'),
+    'git add': toolOk(),
+    'git commit': toolOk('[main 1a2b3c4] Добавить эндпоинт. Tasks 2.1 - 2.4\n'),
+  })
+  const { control, agent } = harness({
+    createCli: () => cli,
+    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    runCommitCommand: tool.run,
+    appendNotice: async () => {
+      throw new Error('the session is already closed')
+    },
+    openSession: async (invocation, context) => ({
+      sessionId: context.range === undefined ? 'session-2' : 'review-1',
+      followup() {},
+      async whenIdle() {},
+    }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  // The work is in the history and the tasks are ticked; a lost transcript line is
+  // not a reason to report a failed run (design D17).
+  assert.match(result.text, /went through: \[main 1a2b3c4\]/u)
+})
+
+test('an empty working tree commits nothing and appends no commit line', async () => {
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({ 'git status': toolOk('') })
+  const notices = []
+  const { control, agent } = harness({
+    createCli: () => cli,
+    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    runCommitCommand: tool.run,
+    appendNotice: async (recipient, text) => {
+      notices.push({ recipient, text })
+      return true
+    },
+    openSession: async (invocation, context) => ({
+      sessionId: context.range === undefined ? 'session-2' : 'review-1',
+      followup() {},
+      async whenIdle() {},
+    }),
+  })
+
+  await control.run(invocation(agent), { change: null })
+
+  assert.deepEqual(notices, [], 'there is no commit id to name')
+})
+
+test('a commit the tool refused stops the run and the report names the tool, the code and the reason', async () => {
+  const both = tickedApply([12, 13])
+  // Only four readings: a commit that failed ends the run, so nothing follows it.
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+  ])
+  const opened = []
+  const tool = scriptedCommitTool({
+    'git status': toolOk('M lib/control.js\n'),
+    'git add': toolOk(),
+    'git commit': toolNo(128, { stderr: 'fatal: not a git repository (or any of the parent directories): .git\n' }),
+  })
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    runCommitCommand: tool.run,
+    openSession: async () => {
+      opened.push('review')
+      return { sessionId: 'review-1', followup() {}, async whenIdle() {} }
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'error')
+  // The tool, its code and its own account of the failure: the user can retry by hand.
+  assert.match(
+    result.text,
+    /the commit of tasks 2\.1 - 2\.4 through git failed at git commit with exit code 128: fatal: not a git repository/u,
+  )
+  assert.match(result.text, /the run stopped and no further task was sent/u)
+  // The group is ticked off and the next one never starts: no message, no session.
+  assert.equal(messages.length, 2)
+  assert.equal(cli.calls.length, 4, 'no reading followed the failed commit')
+  assert.deepEqual(opened, ['review'], 'the session of the next group was never opened')
+})
+
+test('an empty working tree is not committed and the report says there was nothing to commit', async () => {
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(twoTaskFlat([])),
+    cliResult(twoTaskFlat([12])),
+    cliResult(twoTaskFlat([12, 13])),
+  ])
+  const tool = scriptedCommitTool({ 'git status': toolOk('\n') })
+  const { control, agent } = harness({
+    createCli: () => cli,
+    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    runCommitCommand: tool.run,
+    openSession: async () => ({ sessionId: 'review-1', followup() {}, async whenIdle() {} }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  // The status check is the whole commit: nothing is staged on a tree with no changes.
+  assert.deepEqual(tool.calls.map((call) => call.name), ['git status'])
+  assert.match(
+    result.text,
+    /The commit of the whole task list was skipped: the working tree had no uncommitted changes\./u,
+  )
+})
+
+test('a run without a commit message text does not commit and says why', async () => {
+  // A deployment with no source for the text — nothing stored and nobody to ask — is the
+  // `unavailable` case of the seam (5.2). The group must not read as committed, so the
+  // report names the reason instead of staying silent.
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(twoTaskFlat([])),
+    cliResult(twoTaskFlat([12])),
+    cliResult(twoTaskFlat([12, 13])),
+  ])
+  const tool = scriptedCommitTool({})
+  const { control, agent } = harness({
+    createCli: () => cli,
+    runCommitCommand: tool.run,
+    openSession: async () => ({ sessionId: 'review-1', followup() {}, async whenIdle() {} }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  assert.deepEqual(tool.calls, [])
+  assert.match(result.text, /The commit of the whole task list was skipped: the run has no commit message text\./u)
+})
+
+test('a cancelled commit message question starts no run and sends nothing', async () => {
+  // The question is the last thing that may end the command with nothing started (5.2,
+  // spec "Отмена ввода"): the refusal must not claim the run slot, read `tasks.md` or send
+  // a message, so the next `/taskloop` starts from exactly where this one stood.
+  const cli = scriptedCli([cliResult(fixture('repo.json'))])
+  const tool = scriptedCommitTool({})
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    commitText: async () => ({ kind: COMMIT_TEXT.cancelled }),
+    runCommitCommand: tool.run,
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  assert.match(
+    result.text,
+    /no commit message was given for change "add-taskloop-plugin", so the run was not started/u,
+  )
+  assert.match(result.text, /nothing was sent to the model and no files were changed/u)
+  assert.equal(messages.length, 0)
+  // The listing was the only CLI call: no task list was read, and no tool was started.
+  assert.equal(cli.calls.length, 1)
+  assert.deepEqual(tool.calls, [])
+  assert.match(control.status().text, /no run is active/u)
+})
+
+test('commit off means a finished group is not committed and no message is asked for', async () => {
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(twoTaskFlat([])),
+    cliResult(twoTaskFlat([12])),
+    cliResult(twoTaskFlat([12, 13])),
+  ])
+  const tool = scriptedCommitTool({})
+  const asked = []
+  const { control, agent } = harness({
+    createCli: () => cli,
+    config: { commit: { enabled: false } },
+    commitText: async () => {
+      asked.push('text')
+      return { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }
+    },
+    runCommitCommand: tool.run,
+    openSession: async () => ({ sessionId: 'review-1', followup() {}, async whenIdle() {} }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  assert.deepEqual(tool.calls, [])
+  // A text nobody will commit with must not be asked for: the setting is off, so the
+  // question would be a demand for input the run cannot use (design D16).
+  assert.deepEqual(asked, [])
+  assert.doesNotMatch(result.text, /The commit of/u)
+})
+
+test('the commit tool is read at the moment of the commit, so a switch applies to the next group', async () => {
+  // The tool is the one volatile setting read late (D12): a run that started with `git`
+  // commits through `but` when the setting changed after its first turn. A snapshot
+  // taken at the start of the run would keep staging the tree with `git add`.
+  const base = resolveConfig({})
+  const live = { tool: 'git' }
+  const config = {
+    ...base,
+    commit: { ...base.commit, tool: { get: () => live.tool } },
+  }
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(twoTaskFlat([])),
+    cliResult(twoTaskFlat([12])),
+    cliResult(twoTaskFlat([12, 13])),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk('M lib/commit.js\n'),
+    'but commit': toolOk('Committed as 1a2b3c4\n'),
+  })
+  const { control, agent } = harness({
+    createCli: () => cli,
+    config,
+    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    runCommitCommand: tool.run,
+    openSession: async () => ({ sessionId: 'review-1', followup() {}, async whenIdle() {} }),
+    agent: {
+      async whenIdle() {
+        live.tool = 'gitbutler'
+      },
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  // GitButler stages on its own, so the plan is the status check and one request — and
+  // a flat run's message carries no task range (design D13).
+  assert.deepEqual(tool.calls.map((call) => call.name), ['git status', 'but commit'])
+  assert.deepEqual(tool.calls[1].request.args, ['commit', '-m', 'Добавить эндпоинт'])
+  assert.match(result.text, /The commit of the whole task list through gitbutler went through: Committed as 1a2b3c4\./u)
 })
 
 test('the protocol section is off by default and the prompt is never touched', async () => {
@@ -502,7 +1156,7 @@ test('a session opened at a boundary receives the same protocol section, and bot
   const adopted = []
   const { control, agent } = harness({
     createCli: () => cli,
-    config: { protocol: { systemSection: true } },
+    config: { protocol: { systemSection: true }, review: { enabled: false } },
     agent: { ctx: { systemPrompt: source } },
     openSession: async (invocation, context) => {
       adopted.push(typeof context.adoptAgent)
@@ -541,6 +1195,63 @@ test('a change with every task done reports completion and sends nothing', async
   assert.equal(result.kind, 'success')
   assert.match(result.text, /all tracked tasks are complete; no turn was started\./)
   assert.equal(messages.length, 0)
+})
+
+test('a finished change drops its stored commit message', async () => {
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('all-done.json')),
+  ])
+  const { control, forgotten, agent } = harness({ createCli: () => cli })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /all tracked tasks are complete/)
+  // Asked once, for the change the run finished, in the directory it worked in (5.3).
+  assert.deepEqual(forgotten, [{ change: 'add-taskloop-plugin', cwd: CWD }])
+  // Nothing to report: the record went away as it should.
+  assert.doesNotMatch(result.text, /could not be removed/)
+})
+
+test('a run that does not finish the change keeps the stored message', async () => {
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(applyFixture('ready.json')),
+  ])
+  const { control, forgotten, agent } = harness({ createCli: () => cli })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  // The tasks are not done, so the next `/taskloop` continues with the same sentence.
+  assert.equal(result.kind, 'error')
+  assert.deepEqual(forgotten, [])
+})
+
+test('a message that cannot be dropped is a warning, not a failed run', async () => {
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('all-done.json')),
+  ])
+  const { control, forgotten, agent } = harness({
+    createCli: () => cli,
+    forgetCommitText: async () => {
+      throw new Error('EACCES: permission denied')
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  // The work is finished and that is what the user must read; the stale record is a
+  // sentence, because it decides what the next run does (design D16).
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /all tracked tasks are complete/)
+  assert.match(
+    result.text,
+    /Warning: the stored commit message of this change could not be removed \(EACCES: permission denied\); the next run will reuse it\./,
+  )
+  assert.deepEqual(forgotten, [{ change: 'add-taskloop-plugin', cwd: CWD }])
 })
 
 test('a blocked change reports the CLI instruction and sends nothing', async () => {
@@ -1056,6 +1767,51 @@ function gatedContext(scope, listeners, disposed) {
   }
 }
 
+test('a volatile setting changed between runs is read by the next run, not the next mount', async () => {
+  // The resolved config carries references, and D12 says the run reads them when
+  // it starts: the same control must see a new value on its second run without
+  // being mounted again. The option fields are replaced with references over a
+  // value the test mutates between the two runs.
+  const base = resolveConfig({ compaction: { retry: { attempts: 1, delayMs: 0 } } })
+  const live = { onFailure: 'break', midTask: false, systemSection: false }
+  const config = {
+    ...base,
+    compaction: {
+      ...base.compaction,
+      onFailure: { get: () => live.onFailure },
+      midTask: { get: () => live.midTask },
+    },
+    protocol: { ...base.protocol, systemSection: { get: () => live.systemSection } },
+  }
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(progressedApply()),
+  ])
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    config,
+    compactNow: async () => {
+      throw Object.assign(new Error('manual compaction failed: busy'), { code: 'busy' })
+    },
+  })
+
+  const stopped = await control.run(invocation(agent), { change: null })
+  assert.match(stopped.text, /the run stopped and no further task was sent/)
+  assert.doesNotMatch(stopped.text, /Warning:/, 'the break policy reports the stop alone')
+  assert.equal(messages.length, 1)
+
+  live.onFailure = 'continue'
+  const continued = await control.run(invocation(agent), { change: null })
+  assert.match(continued.text, /Warning: compaction before task 2\.4 failed after 1 attempt \(busy\)/)
+  assert.equal(messages.length, 3, 'the second run sent 2.3 and 2.4')
+  assert.equal(cli.calls.length, 7)
+})
+
 test('step compaction is off by default: no listener is registered and nothing is called', async () => {
   const cli = scriptedCli([
     cliResult(fixture('repo.json')),
@@ -1146,7 +1902,7 @@ test('a session opened at a boundary is handed the step gate too', async () => {
   }
   const { control, agent } = harness({
     createCli: () => cli,
-    config: { compaction: { midTask: true } },
+    config: { compaction: { midTask: true }, review: { enabled: false } },
     compactIfNeeded: async () => null,
     agent: { ctx: gatedContext('agent-1', listeners, disposed) },
     openSession: async (invocation, context) => {

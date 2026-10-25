@@ -33,6 +33,9 @@ function fakeContext() {
     effect(callback) {
       return callback()
     },
+    // A deployment without Settings: `apply` asks for the service and the callback
+    // never runs, so mounting a command stays independent of the client half.
+    inject() {},
   }
   return { ctx, registrations }
 }
