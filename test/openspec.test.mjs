@@ -1,15 +1,24 @@
-// Tests for the `openspec` CLI invocation (task 2.1).
+// Tests for the `openspec` CLI invocation (tasks 2.1, 9.1).
 //
 // No real child process is started: the tests are about the wrapper's own
 // contract — which failures it classifies, that a nonzero exit stays a result,
-// and that a hung CLI is cut off at `openspec.timeoutMs`. A fake subprocess
-// service supplies the exit facts, so the assertions hold without `openspec`
-// being installed and without depending on how fast a real CLI answers.
+// that a hung CLI is cut off at `openspec.timeoutMs`, and that a CLI below the
+// supported floor is refused before the first read. A fake subprocess service
+// supplies the exit facts, so the assertions hold without `openspec` being
+// installed and without depending on how fast a real CLI answers.
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { OPENSPEC_COMMAND, OPENSPEC_ERROR, OpenSpecCli, OpenSpecError } from '../lib/openspec.js'
+import {
+  MIN_OPENSPEC_VERSION,
+  OPENSPEC_COMMAND,
+  OPENSPEC_ERROR,
+  OpenSpecCli,
+  OpenSpecError,
+  compareOpenSpecVersions,
+  parseOpenSpecVersion,
+} from '../lib/openspec.js'
 
 /** A reader whose whole retained text is `text`. */
 const reader = (text, lossy = false) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy }) })
@@ -196,4 +205,124 @@ test('a non-positive timeout is refused at construction', () => {
   assert.throws(() => new OpenSpecCli(subprocess, { timeoutMs: 0 }), TypeError)
   assert.throws(() => new OpenSpecCli(subprocess, { timeoutMs: 1.5 }), TypeError)
   assert.throws(() => new OpenSpecCli(undefined, { timeoutMs: 1_000 }), TypeError)
+})
+
+/**
+ * A CLI wrapper whose `--version` answer is `answer`.
+ *
+ * @param {string} answer - printed stdout.
+ * @param {number} [exitCode] - process exit code.
+ * @returns {{cli: OpenSpecCli, subprocess: object}} the wrapper and its recording fake.
+ */
+function versionCli(answer, exitCode = 0) {
+  const subprocess = fakeSubprocess({
+    spawn: () => handleOf({ outcome: { exitCode }, stdout: answer }),
+  })
+  return { cli: new OpenSpecCli(subprocess, { timeoutMs: 120_000 }), subprocess }
+}
+
+test('the first X.Y.Z of an answer is the version', () => {
+  assert.deepEqual(parseOpenSpecVersion('1.14.1\n'), { major: 1, minor: 14, patch: 1 })
+  assert.deepEqual(parseOpenSpecVersion('openspec 0.14.0\n'), { major: 0, minor: 14, patch: 0 })
+  // Pre-release and build metadata are dropped: the gate is about the contract, not semver.
+  assert.deepEqual(parseOpenSpecVersion('0.14.0-beta.2'), { major: 0, minor: 14, patch: 0 })
+  assert.deepEqual(parseOpenSpecVersion('openspec cli v1.14.1+build.7 (node 24)'), { major: 1, minor: 14, patch: 1 })
+  // The first version in the text wins, whatever follows it.
+  assert.deepEqual(parseOpenSpecVersion('openspec 0.15.0 (node 20.11.0)'), { major: 0, minor: 15, patch: 0 })
+})
+
+test('an answer without a version is not a version', () => {
+  assert.equal(parseOpenSpecVersion(''), undefined)
+  assert.equal(parseOpenSpecVersion('openspec: unknown version'), undefined)
+  assert.equal(parseOpenSpecVersion('1.14'), undefined)
+  // A number nobody could compare is not a version either.
+  assert.equal(parseOpenSpecVersion('99999999999999999999.1.1'), undefined)
+  assert.equal(parseOpenSpecVersion(undefined), undefined)
+})
+
+test('versions are compared by numeric components, not as text', () => {
+  const version = (text) => parseOpenSpecVersion(text)
+  const minimum = version(MIN_OPENSPEC_VERSION)
+
+  assert.ok(compareOpenSpecVersions(version('0.9.0'), minimum) < 0, '0.9.0 is older than 0.14.0')
+  // The reason the comparison exists: as text, '0.9.0' sorts after '0.14.0'.
+  assert.ok('0.9.0' > MIN_OPENSPEC_VERSION)
+  assert.equal(compareOpenSpecVersions(version('0.14.0'), minimum), 0, '0.14.0 is the minimum itself')
+  assert.ok(compareOpenSpecVersions(version('1.14.1'), minimum) > 0, '1.14.1 is newer than the minimum')
+  assert.ok(compareOpenSpecVersions(version('0.14.1'), version('0.14.0')) > 0)
+  assert.ok(compareOpenSpecVersions(version('0.2.0'), version('0.14.0')) < 0)
+
+  assert.throws(() => compareOpenSpecVersions(undefined, minimum), TypeError)
+  assert.throws(() => compareOpenSpecVersions(version('0.14.0'), {}), TypeError)
+})
+
+test('a supported CLI resolves its version and is asked once per run', async () => {
+  const { cli, subprocess } = versionCli('1.14.1\n')
+
+  assert.deepEqual(await cli.ensureSupportedVersion({ cwd }), { major: 1, minor: 14, patch: 1 })
+  // The second ask is the same answer, not a second process: the wrapper remembers the verdict.
+  assert.deepEqual(await cli.ensureSupportedVersion({ cwd }), { major: 1, minor: 14, patch: 1 })
+
+  assert.deepEqual(subprocess.calls.spawn[0].argv, ['/usr/local/bin/openspec', '--version'])
+  assert.equal(subprocess.calls.spawn[0].cwd, cwd)
+  assert.equal(subprocess.calls.spawn.length, 1)
+})
+
+test('the minimum version itself is supported', async () => {
+  const { cli } = versionCli('0.14.0')
+
+  assert.deepEqual(await cli.ensureSupportedVersion({ cwd }), { major: 0, minor: 14, patch: 0 })
+})
+
+test('a pre-release at the floor counts as the floor', async () => {
+  // Design D20: the gate exists to exclude the old contract, not to honour semver ordering.
+  const { cli } = versionCli('0.14.0-beta.2\n')
+
+  assert.deepEqual(await cli.ensureSupportedVersion({ cwd }), { major: 0, minor: 14, patch: 0 })
+})
+
+test('a CLI below the floor is refused with both versions and the advice to update', async () => {
+  const { cli } = versionCli('0.9.0\n')
+
+  await assert.rejects(cli.ensureSupportedVersion({ cwd }), (error) => {
+    assert.ok(error instanceof OpenSpecError)
+    assert.equal(error.code, OPENSPEC_ERROR.outdated)
+    assert.match(error.message, /openspec 0\.9\.0 is older than the minimum 0\.14\.0/)
+    assert.match(error.message, /update OpenSpec to 0\.14\.0 or newer/)
+    assert.deepEqual(error.args, ['--version'])
+    return true
+  })
+})
+
+test('an answer without a version stops the run instead of guessing', async () => {
+  const { cli } = versionCli('openspec: unknown build\n./src/cli.ts\n')
+
+  await assert.rejects(cli.ensureSupportedVersion({ cwd }), (error) => {
+    assert.equal(error.code, OPENSPEC_ERROR.unrecognized)
+    assert.match(error.message, /the openspec version could not be determined/)
+    assert.match(error.message, /printed no X\.Y\.Z version/)
+    assert.match(error.message, /0\.14\.0 or newer is required/)
+    return true
+  })
+})
+
+test('a --version that fails is unrecognized even when it printed something', async () => {
+  const { cli } = versionCli('0.9.0', 2)
+
+  await assert.rejects(cli.ensureSupportedVersion({ cwd }), (error) => {
+    assert.equal(error.code, OPENSPEC_ERROR.unrecognized)
+    assert.match(error.message, /openspec --version exited with code 2/)
+    return true
+  })
+})
+
+test('a hung --version is the wrapper\'s timeout, not an unrecognized version', async () => {
+  const handle = handleOf() // `done` never settles.
+  const cli = new OpenSpecCli(fakeSubprocess({ spawn: () => handle }), { timeoutMs: 25 })
+
+  await assert.rejects(cli.ensureSupportedVersion({ cwd }), (error) => {
+    assert.equal(error.code, OPENSPEC_ERROR.timeout)
+    return true
+  })
+  assert.equal(handle.terminated, 1)
 })

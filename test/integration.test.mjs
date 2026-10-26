@@ -167,6 +167,9 @@ function createSubprocess(project, events, snapshot = () => {}) {
    * @throws {Error} when the run started something this fake host does not know.
    */
   const answerOf = (program, args) => {
+    // `--version` is the first thing a run asks for (9.2, design D20), and it is answered
+    // with a supported version: this scenario is about the group boundary, not the gate.
+    if (program === 'openspec' && args[0] === '--version') return { stdout: '1.14.1\n' }
     if (program === 'openspec' && args[0] === 'list') return { stdout: listing() }
     if (program === 'openspec' && args[0] === 'instructions') return { stdout: project.reading() }
     if (program !== 'git') {

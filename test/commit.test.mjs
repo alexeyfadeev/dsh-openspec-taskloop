@@ -1,4 +1,5 @@
-// Tests for the commit that closes a task group (task 4.1).
+// Tests for the commit that closes a task group (task 4.1) and the GitButler branch
+// it commits into (task 7.2).
 //
 // The commit is the plugin's own step (design D15), so its contract is pinned here
 // without a host: the message is the user's text plus the range of the group, the
@@ -6,9 +7,14 @@
 // normal answer, and a refusal comes back as data — the tool, the request that
 // failed, its exit code and its own explanation — rather than as a thrown error.
 //
+// The branch part is a plan object (design D18) rather than an argument: a new branch
+// is created by the first commit that has something to commit and by no later one, so
+// the tests drive two commits of a run through one plan and count the requests.
+//
 // The fakes record the requests in order: whether `git commit` follows `git add`,
-// and whether anything at all follows a status check that says the tree is empty,
-// is exactly what the report on a failed run depends on.
+// whether `but branch new` precedes `but commit`, and whether anything at all follows
+// a status check that says the tree is empty, is exactly what the report on a failed
+// run depends on.
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
@@ -19,6 +25,7 @@ import {
   buildCommitCommands,
   buildCommitMessage,
   commitIdOf,
+  createButBranch,
   runCommit,
 } from '../lib/commit.js'
 import { COMMIT_TOOLS } from '../lib/config.js'
@@ -404,4 +411,163 @@ test('the tool is part of every outcome, so a report can name it', async () => {
   assert.equal(outcome.command, 'but commit')
   assert.equal(outcome.exitCode, 1)
   assert.match(outcome.reason, /no branch assigned/u)
+})
+
+// --- the GitButler branch of a run (task 7.2, design D18) -------------------
+
+const BRANCH = { name: 'feature-a', exists: true }
+
+test('GitButler commits into the branch the run selected', () => {
+  assert.deepEqual(buildCommitCommands({ tool: 'gitbutler', message: GROUPED, branch: BRANCH }), [
+    { executable: 'but', args: ['commit', 'feature-a', '-m', GROUPED] },
+  ])
+})
+
+test('a new branch is created by name, with its anchor when there is one', () => {
+  assert.deepEqual(
+    buildCommitCommands({
+      tool: 'gitbutler', message: GROUPED, branch: { name: 'feature-b', anchor: 'feature-a', exists: false },
+    }),
+    [
+      { executable: 'but', args: ['branch', 'new', 'feature-b', '-a', 'feature-a'] },
+      { executable: 'but', args: ['commit', 'feature-b', '-m', GROUPED] },
+    ],
+  )
+  // A project without applied branches has nothing to stack on: no `-a` at all.
+  assert.deepEqual(
+    buildCommitCommands({ tool: 'gitbutler', message: GROUPED, branch: { name: 'first', exists: false } }),
+    [
+      { executable: 'but', args: ['branch', 'new', 'first'] },
+      { executable: 'but', args: ['commit', 'first', '-m', GROUPED] },
+    ],
+  )
+})
+
+test('git ignores a branch plan, so a switch to git changes no argument', () => {
+  assert.deepEqual(buildCommitCommands({ tool: 'git', message: GROUPED, branch: { name: 'x', exists: false } }), [
+    { executable: 'git', args: ['add', '-A'] },
+    { executable: 'git', args: ['commit', '-m', GROUPED] },
+  ])
+})
+
+test('a branch plan that cannot name a branch is refused before anything runs', () => {
+  assert.throws(() => createButBranch({}), /non-empty branch name/u)
+  assert.throws(() => createButBranch({ name: '   ' }), /non-empty branch name/u)
+  assert.throws(() => createButBranch({ name: 'feature-a', anchor: '' }), /non-empty anchor/u)
+  assert.throws(
+    () => buildCommitCommands({ tool: 'gitbutler', message: GROUPED, branch: { exists: true } }),
+    /non-empty branch name/u,
+  )
+  assert.throws(
+    () => buildCommitCommands({ tool: 'gitbutler', message: GROUPED, branch: { name: 'x', anchor: ' ' } }),
+    /non-empty anchor/u,
+  )
+})
+
+test('the plan reads its branch name and anchor, and exists only when it says so', () => {
+  assert.deepEqual(createButBranch({ name: ' feature-a ' }), { name: 'feature-a', exists: false })
+  assert.deepEqual(
+    createButBranch({ name: 'feature-b', anchor: 'feature-a' }),
+    { name: 'feature-b', anchor: 'feature-a', exists: false },
+  )
+  assert.deepEqual(
+    createButBranch({ name: 'feature-a', exists: true }),
+    { name: 'feature-a', exists: true },
+  )
+})
+
+test('a new branch is created on the first commit and not on the next one', async () => {
+  const branch = createButBranch({ name: 'feature-b', anchor: 'feature-a' })
+  const { run, calls } = fakeRunner({
+    'git status': ok('M lib/commit.js\n'),
+    'but branch': ok('Created branch feature-b\n'),
+    'but commit': ok('Committed as 1a2b3c4\n'),
+  })
+
+  const first = await runCommit({ tool: 'gitbutler', text: TEXT, range: RANGE, branch, cwd: '/repo', run })
+
+  // The order is the contract: the tree is checked, the branch created, then committed.
+  assert.deepEqual(calls.map((call) => call.name), ['git status', 'but branch', 'but commit'])
+  assert.deepEqual(calls[1].args, ['branch', 'new', 'feature-b', '-a', 'feature-a'])
+  assert.deepEqual(calls[2].args, ['commit', 'feature-b', '-m', GROUPED])
+  assert.equal(first.kind, COMMIT_END.committed)
+  assert.equal(first.branch, 'feature-b')
+  assert.equal(branch.exists, true)
+
+  // The second group of the same run finds the branch and only commits into it.
+  calls.length = 0
+  const next = { from: '2.5', to: '2.8' }
+  const second = await runCommit({ tool: 'gitbutler', text: TEXT, range: next, branch, cwd: '/repo', run })
+
+  assert.deepEqual(calls.map((call) => call.name), ['git status', 'but commit'])
+  assert.deepEqual(calls[1].args, ['commit', 'feature-b', '-m', 'Добавить эндпоинт. Tasks 2.5 - 2.8'])
+  assert.equal(second.kind, COMMIT_END.committed)
+})
+
+test('an empty tree creates no branch and leaves the plan for the next group', async () => {
+  const branch = createButBranch({ name: 'feature-b', anchor: 'feature-a' })
+  const { run, calls } = fakeRunner({ 'git status': ok('') })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler', text: TEXT, range: RANGE, branch, cwd: '/repo', run,
+  })
+
+  assert.deepEqual(calls.map((call) => call.name), ['git status'])
+  assert.equal(outcome.kind, COMMIT_END.empty)
+  assert.equal(outcome.branch, 'feature-b')
+  assert.equal(branch.exists, false)
+})
+
+test('a branch creation that failed stops the commit before anything is committed', async () => {
+  const branch = createButBranch({ name: 'feature-b', anchor: 'feature-a' })
+  const { run, calls } = fakeRunner({
+    'git status': ok('M lib/commit.js\n'),
+    'but branch': no(1, { stderr: 'branch feature-b already exists\n' }),
+  })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler', text: TEXT, range: RANGE, branch, cwd: '/repo', run,
+  })
+
+  assert.deepEqual(calls.map((call) => call.name), ['git status', 'but branch'])
+  assert.equal(outcome.kind, COMMIT_END.failed)
+  assert.equal(outcome.command, 'but branch')
+  assert.equal(outcome.exitCode, 1)
+  assert.match(outcome.reason, /already exists/u)
+  // Nothing was created, so the plan still owes the request.
+  assert.equal(branch.exists, false)
+})
+
+test('a stop while the branch is being created commits nothing and keeps the plan pending', async () => {
+  const controller = new AbortController()
+  const branch = createButBranch({ name: 'feature-b', anchor: 'feature-a' })
+  const { run, calls } = fakeRunner({
+    'git status': ok('M lib/commit.js\n'),
+    'but branch': () => {
+      controller.abort()
+      return ok('Created branch feature-b\n')
+    },
+  })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler', text: TEXT, range: RANGE, branch, cwd: '/repo', run, signal: controller.signal,
+  })
+
+  assert.deepEqual(calls.map((call) => call.name), ['git status', 'but branch'])
+  assert.equal(outcome.kind, COMMIT_END.stopped)
+  // The tool did create it, so a later attempt must not create it again.
+  assert.equal(branch.exists, true)
+})
+
+test('a commit without a branch stays `but commit -m`, as before the plan existed', async () => {
+  const { run, calls } = fakeRunner({
+    'git status': ok('M lib/commit.js\n'),
+    'but commit': ok('Committed as 1a2b3c4\n'),
+  })
+
+  const outcome = await runCommit({ tool: 'gitbutler', text: TEXT, range: RANGE, cwd: '/repo', run })
+
+  assert.deepEqual(calls[1].args, ['commit', '-m', GROUPED])
+  // No branch was named, so the report has none to name either.
+  assert.equal('branch' in outcome, false)
 })

@@ -13,12 +13,15 @@ import { test } from 'node:test'
 import {
   DESCRIPTION_QUESTION_ID,
   EXPLORE_ANSWER,
+  EXPLORE_MODE_PROMPT,
   EXPLORE_SKILL_PATH,
   buildDescriptionQuestion,
   buildExplorePrompt,
   createExploreMessage,
+  createExploreModeMessage,
   readDescription,
   requestDescription,
+  sendExploreModePrompt,
   sendExplorePrompt,
   startExplore,
 } from '../lib/explore.js'
@@ -230,4 +233,48 @@ test('an unavailable channel sends nothing', async () => {
 
   assert.equal(outcome.kind, EXPLORE_ANSWER.unavailable)
   assert.equal(messages.length, 0)
+})
+
+// The change-free `/taskloop explore` form (design D19): one fixed sentence, no
+// description, no question, and the same single-followup guarantee as above.
+
+test('the explore-mode instruction is the fixed sentence naming the skill', () => {
+  // Pinned verbatim: the user asked for this instruction, so it is not a template
+  // and not a configurable value.
+  assert.equal(
+    EXPLORE_MODE_PROMPT,
+    'Используя навык .dsh/skills/openspec-explore перейди в режим explore, '
+      + 'спроси у пользователя, что будем исследовать',
+  )
+  assert.equal(EXPLORE_MODE_PROMPT.split('\n').length, 1, 'the text is one line')
+  assert.ok(EXPLORE_MODE_PROMPT.includes(EXPLORE_SKILL_PATH))
+})
+
+test('the explore-mode message is one user text block with a fresh id', () => {
+  const first = createExploreModeMessage()
+  const second = createExploreModeMessage()
+
+  assert.equal(first.role, 'user')
+  assert.deepEqual(first.source, { kind: 'user' })
+  assert.equal(first.content.length, 1)
+  assert.deepEqual(first.content[0], { type: 'text', text: EXPLORE_MODE_PROMPT })
+  assert.equal(typeof first.id, 'string')
+  assert.notEqual(first.id, second.id)
+})
+
+test('sending the explore-mode prompt calls followup exactly once', () => {
+  const { agent, messages } = fakeAgent()
+
+  const message = sendExploreModePrompt({ agent })
+
+  assert.equal(messages.length, 1)
+  assert.equal(messages[0], message)
+  assert.equal(messages[0].content[0].text, EXPLORE_MODE_PROMPT)
+})
+
+test('an agent that cannot take the explore-mode follow-up fails before anything is sent', () => {
+  assert.throws(
+    () => sendExploreModePrompt({ agent: { id: 'agent-1' } }),
+    /agent that accepts a follow-up/,
+  )
 })

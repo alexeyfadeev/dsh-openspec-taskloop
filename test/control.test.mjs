@@ -14,10 +14,18 @@ import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import { INIT_ARGS, INIT_ANSWER } from '../lib/bootstrap.js'
+import { createButBranch } from '../lib/commit.js'
 import { COMMIT_TEXT } from '../lib/commit-text.js'
 import { resolveConfig } from '../lib/config.js'
 import { createControl } from '../lib/control.js'
-import { EXPLORE_ANSWER, EXPLORE_SKILL_PATH, sendExplorePrompt } from '../lib/explore.js'
+import {
+  EXPLORE_ANSWER,
+  EXPLORE_MODE_PROMPT,
+  EXPLORE_SKILL_PATH,
+  sendExploreModePrompt,
+  sendExplorePrompt,
+} from '../lib/explore.js'
+import { MIN_OPENSPEC_VERSION, OpenSpecCli } from '../lib/openspec.js'
 import { PROTOCOL_SECTION } from '../lib/protocol.js'
 
 const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'listing')
@@ -135,21 +143,35 @@ const cliResult = (stdout, exitCode = 0) => ({ exitCode, stdout, stderr: '', tru
 /**
  * A fake CLI that answers each call from a script and records the calls.
  *
+ * The version gate (9.2) is a method of its own, so a run that passes it spends no
+ * scripted answer; `order` records both kinds of step, which is how a test sees that the
+ * gate came first.
+ *
  * @param {object[]} responses - settled results, consumed in call order.
- * @returns {object} the fake wrapper with a `calls` log.
+ * @returns {object} the fake wrapper with a `calls` log, a `versions` count and an `order` log.
  */
 function scriptedCli(responses) {
   const calls = []
-  return {
+  const order = []
+  const cli = {
     calls,
+    order,
+    versions: 0,
+    async ensureSupportedVersion() {
+      cli.versions += 1
+      order.push('version')
+      return { major: 1, minor: 14, patch: 1 }
+    },
     async run(args, options) {
       calls.push({ args, options })
+      order.push(args.join(' '))
       const next = responses.shift()
       if (next === undefined) throw new Error(`unexpected CLI call: ${args.join(' ')}`)
       if (next instanceof Error) throw next
       return next
     },
   }
+  return cli
 }
 
 /**
@@ -190,7 +212,8 @@ function recordingPrompt() {
  * @param {Function} [options.compactIfNeeded] - one step-boundary compaction call (6.3).
  * @param {Function} [options.setApproval] - approval narrowing of a review session (3.3).
  * @param {Function} [options.runCommitCommand] - runner of the commit tool (4.2/4.3).
- * @param {Function} [options.commitText] - message text source of this change's commits (4.3).
+ * @param {Function} [options.commitInput] - the input of this change's commits: the message
+ *   text and, for GitButler, the branch (5.2, 7.3).
  * @param {Function} [options.forgetCommitText] - dropping the stored text of a finished change (5.3).
  * @returns {{control: object, asked: object[], descriptions: object[], messages: object[], approvals: string[], agent: object, forgotten: object[]}}
  *   the control, the initialisation questions, the description questions, the
@@ -208,7 +231,7 @@ function harness({
   compactIfNeeded,
   setApproval,
   runCommitCommand,
-  commitText,
+  commitInput,
   forgetCommitText,
   appendNotice,
 }) {
@@ -241,6 +264,7 @@ function harness({
       agent: invocation.agent,
       description,
     }),
+    followupExploreMode: (invocation) => sendExploreModePrompt({ agent: invocation.agent }),
     openSession,
     compactNow,
     compactIfNeeded,
@@ -249,7 +273,7 @@ function harness({
       await setApproval?.(sessionId)
     },
     runCommitCommand,
-    commitText,
+    commitInput,
     appendNotice,
     forgetCommitText: async (context) => {
       forgotten.push(context)
@@ -667,10 +691,12 @@ test('a finished group is committed after its review, with the message as one ar
   }, events)
   const { control, agent } = harness({
     createCli: () => cli,
-    commitText: async (invocation, context) => {
+    commitInput: async (invocation, context) => {
       events.push('text')
       assert.equal(context.change, 'add-taskloop-plugin')
       assert.equal(context.cwd, CWD)
+      // The tool the run started with decides whether a branch question exists (D18).
+      assert.equal(context.tool, 'git')
       return { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }
     },
     runCommitCommand: tool.run,
@@ -717,7 +743,7 @@ test('the session that drove the group gets the commit id as soon as the tool co
   const notices = []
   const { control, agent } = harness({
     createCli: () => cli,
-    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
     runCommitCommand: tool.run,
     appendNotice: async (recipient, text) => {
       notices.push({ recipient, text })
@@ -759,7 +785,7 @@ test('the commit line quotes the tool when its output names no id', async () => 
   const notices = []
   const { control, agent } = harness({
     createCli: () => cli,
-    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
     runCommitCommand: tool.run,
     appendNotice: async (recipient, text) => {
       notices.push({ recipient, text })
@@ -796,7 +822,7 @@ test('a commit line that cannot be appended leaves the finished run a success', 
   })
   const { control, agent } = harness({
     createCli: () => cli,
-    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
     runCommitCommand: tool.run,
     appendNotice: async () => {
       throw new Error('the session is already closed')
@@ -828,7 +854,7 @@ test('an empty working tree commits nothing and appends no commit line', async (
   const notices = []
   const { control, agent } = harness({
     createCli: () => cli,
-    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
     runCommitCommand: tool.run,
     appendNotice: async (recipient, text) => {
       notices.push({ recipient, text })
@@ -863,7 +889,7 @@ test('a commit the tool refused stops the run and the report names the tool, the
   })
   const { control, messages, agent } = harness({
     createCli: () => cli,
-    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
     runCommitCommand: tool.run,
     openSession: async () => {
       opened.push('review')
@@ -896,7 +922,7 @@ test('an empty working tree is not committed and the report says there was nothi
   const tool = scriptedCommitTool({ 'git status': toolOk('\n') })
   const { control, agent } = harness({
     createCli: () => cli,
-    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
     runCommitCommand: tool.run,
     openSession: async () => ({ sessionId: 'review-1', followup() {}, async whenIdle() {} }),
   })
@@ -944,7 +970,7 @@ test('a cancelled commit message question starts no run and sends nothing', asyn
   const tool = scriptedCommitTool({})
   const { control, messages, agent } = harness({
     createCli: () => cli,
-    commitText: async () => ({ kind: COMMIT_TEXT.cancelled }),
+    commitInput: async () => ({ kind: COMMIT_TEXT.cancelled }),
     runCommitCommand: tool.run,
   })
 
@@ -975,7 +1001,7 @@ test('commit off means a finished group is not committed and no message is asked
   const { control, agent } = harness({
     createCli: () => cli,
     config: { commit: { enabled: false } },
-    commitText: async () => {
+    commitInput: async () => {
       asked.push('text')
       return { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }
     },
@@ -1016,7 +1042,7 @@ test('the commit tool is read at the moment of the commit, so a switch applies t
   const { control, agent } = harness({
     createCli: () => cli,
     config,
-    commitText: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
     runCommitCommand: tool.run,
     openSession: async () => ({ sessionId: 'review-1', followup() {}, async whenIdle() {} }),
     agent: {
@@ -1030,10 +1056,225 @@ test('the commit tool is read at the moment of the commit, so a switch applies t
 
   assert.equal(result.kind, 'success')
   // GitButler stages on its own, so the plan is the status check and one request — and
-  // a flat run's message carries no task range (design D13).
+  // a flat run's message carries no task range (design D13). No branch was asked for
+  // (the tool was `git` when the input was settled), so `but commit` gets no branch
+  // argument and the report says exactly that (D18).
   assert.deepEqual(tool.calls.map((call) => call.name), ['git status', 'but commit'])
   assert.deepEqual(tool.calls[1].request.args, ['commit', '-m', 'Добавить эндпоинт'])
-  assert.match(result.text, /The commit of the whole task list through gitbutler went through: Committed as 1a2b3c4\./u)
+  assert.match(
+    result.text,
+    /The commit of the whole task list through gitbutler without naming a branch went through: Committed as 1a2b3c4\./u,
+  )
+})
+
+test('a GitButler run commits into the branch its input named', async () => {
+  // The branch is an input of the run (7.3, design D18): the plan the seam settled is
+  // what every commit of the run names, and both the report and the transcript line say
+  // where the history moved (7.4).
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk('M lib/control.js\n'),
+    'but commit': toolOk('Committed as 1a2b3c4\n'),
+  })
+  const notices = []
+  const { control, agent } = harness({
+    createCli: () => cli,
+    config: { commit: { tool: 'gitbutler' } },
+    commitInput: async (invocation, context) => {
+      // The tool the run started with is what decides there is a branch to ask about.
+      assert.equal(context.tool, 'gitbutler')
+      return {
+        kind: COMMIT_TEXT.text,
+        text: 'Добавить эндпоинт',
+        branch: createButBranch({ name: 'feature-a', exists: true }),
+      }
+    },
+    runCommitCommand: tool.run,
+    appendNotice: async (recipient, text) => {
+      notices.push(text)
+      return true
+    },
+    openSession: async (invocation, context) => ({
+      sessionId: context.range === undefined ? 'session-2' : 'review-1',
+      followup() {},
+      async whenIdle() {},
+    }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  // The tree is checked once and the commit names the branch before the message.
+  assert.deepEqual(tool.calls.map((call) => call.name), ['git status', 'but commit'])
+  assert.deepEqual(
+    tool.calls[1].request.args,
+    ['commit', 'feature-a', '-m', 'Добавить эндпоинт. Tasks 2.1 - 2.4'],
+  )
+  assert.match(
+    result.text,
+    /The commit of tasks 2\.1 - 2\.4 through gitbutler into branch "feature-a" went through: Committed as 1a2b3c4\./u,
+  )
+  assert.deepEqual(notices, [
+    'taskloop: commit 1a2b3c4 for tasks 2.1 - 2.4 into branch "feature-a" (gitbutler).',
+  ])
+})
+
+test('a new branch is created right before the first commit, and only there', async () => {
+  // The plan starts as "does not exist" (D18): the branch is created after the status
+  // check of the first commit that has something in it, never at the start of the run.
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk(' M lib/loop.js\n'),
+    'but branch': toolOk(),
+    'but commit': toolOk('Committed as 1a2b3c4\n'),
+  })
+  const plan = createButBranch({ name: 'feature-x', anchor: 'feature-a' })
+  const { control, agent } = harness({
+    createCli: () => cli,
+    config: { commit: { tool: 'gitbutler' } },
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт', branch: plan }),
+    runCommitCommand: tool.run,
+    openSession: async (invocation, context) => ({
+      sessionId: context.range === undefined ? 'session-2' : 'review-1',
+      followup() {},
+      async whenIdle() {},
+    }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.deepEqual(tool.calls.map((call) => call.name), ['git status', 'but branch', 'but commit'])
+  assert.deepEqual(tool.calls[1].request.args, ['branch', 'new', 'feature-x', '-a', 'feature-a'])
+  assert.deepEqual(
+    tool.calls[2].request.args,
+    ['commit', 'feature-x', '-m', 'Добавить эндпоинт. Tasks 2.1 - 2.4'],
+  )
+  // The plan is the run's own memory: `exists` is flipped once the creation went through,
+  // so a later group of the same run cannot try to create the branch again.
+  assert.equal(plan.exists, true)
+  assert.match(result.text, /through gitbutler into branch "feature-x" went through/u)
+})
+
+test('an empty tree creates no branch and commits nothing', async () => {
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({ 'git status': toolOk('') })
+  const plan = createButBranch({ name: 'feature-x', anchor: 'feature-a' })
+  const { control, agent } = harness({
+    createCli: () => cli,
+    config: { commit: { tool: 'gitbutler' } },
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт', branch: plan }),
+    runCommitCommand: tool.run,
+    openSession: async (invocation, context) => ({
+      sessionId: context.range === undefined ? 'session-2' : 'review-1',
+      followup() {},
+      async whenIdle() {},
+    }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.deepEqual(tool.calls.map((call) => call.name), ['git status'])
+  assert.equal(plan.exists, false, 'no branch may be left behind with no commit in it')
+  assert.match(result.text, /The commit of tasks 2\.1 - 2\.4 was skipped: the working tree had no uncommitted changes\./u)
+})
+
+test('a cancelled branch question starts no run and says which question it was', async () => {
+  // One refused card is the end of the command (spec "Отмена выбора ветки"), and the
+  // sentence names the branch, because blaming the message would send the user to the
+  // wrong question on the next `/taskloop` (7.3).
+  const cli = scriptedCli([cliResult(fixture('repo.json'))])
+  const tool = scriptedCommitTool({})
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    config: { commit: { tool: 'gitbutler' } },
+    commitInput: async () => ({ kind: COMMIT_TEXT.cancelled, step: 'branch' }),
+    runCommitCommand: tool.run,
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  assert.match(
+    result.text,
+    /no GitButler branch was chosen for change "add-taskloop-plugin", so the run was not started/u,
+  )
+  assert.match(result.text, /nothing was sent to the model and no files were changed/u)
+  assert.equal(messages.length, 0)
+  // The listing was the only CLI call: no task list was read, and no tool was started.
+  assert.equal(cli.calls.length, 1)
+  assert.deepEqual(tool.calls, [])
+  assert.match(control.status().text, /no run is active/u)
+})
+
+test('a refused anchor of a new branch is reported as that question', async () => {
+  const cli = scriptedCli([cliResult(fixture('repo.json'))])
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    config: { commit: { tool: 'gitbutler' } },
+    commitInput: async () => ({ kind: COMMIT_TEXT.cancelled, step: 'anchor' }),
+    runCommitCommand: scriptedCommitTool({}).run,
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  assert.match(
+    result.text,
+    /no anchor branch was chosen for the new GitButler branch of change "add-taskloop-plugin", so the run was not started/u,
+  )
+  assert.equal(messages.length, 0)
+  assert.equal(cli.calls.length, 1)
+})
+
+test('a branch listing that cannot be read stops the command before the first task', async () => {
+  // A `but status --json` failure is fail-fast (7.3, spec "Сбой чтения веток"): the run
+  // must not start and fail at the end of the first group instead, after the work is
+  // done. The command result carries the tool's words and the hint to set the project up.
+  const cli = scriptedCli([cliResult(fixture('repo.json'))])
+  const tool = scriptedCommitTool({})
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    config: { commit: { tool: 'gitbutler' } },
+    commitInput: async () => {
+      throw new Error(
+        'but status --json failed with exit code 1: fatal: not a GitButler project. '
+          + 'The project must be a GitButler project (`but setup` in it) and `but` must be on PATH.',
+      )
+    },
+    runCommitCommand: tool.run,
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /^taskloop: /u)
+  assert.match(result.text, /but status --json failed with exit code 1/u)
+  assert.match(result.text, /but setup/u)
+  // Nothing was sent, no task list was read, no tool was started and the slot is free.
+  assert.equal(messages.length, 0)
+  assert.equal(cli.calls.length, 1)
+  assert.deepEqual(tool.calls, [])
+  assert.match(control.status().text, /no run is active/u)
 })
 
 test('the protocol section is off by default and the prompt is never touched', async () => {
@@ -1368,6 +1609,95 @@ test('a project without changes sends exactly one explore message and starts no 
   assert.equal(cli.calls.length, 1)
 })
 
+test('`/taskloop explore` sends the fixed instruction once and reads nothing', async () => {
+  // The scripted CLI has no answer to give, so any call to it fails the test: this
+  // form must not read the project at all (design D19).
+  const cli = scriptedCli([])
+  const { control, asked, descriptions, messages, agent } = harness({ createCli: () => cli })
+
+  const result = control.explore(invocation(agent))
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /^taskloop: explore mode requested/)
+  assert.match(result.text, /no task loop was started/)
+  assert.equal(messages.length, 1)
+  assert.equal(messages[0].role, 'user')
+  assert.equal(messages[0].content.length, 1)
+  assert.equal(messages[0].content[0].text, EXPLORE_MODE_PROMPT)
+  assert.equal(cli.calls.length, 0, 'explore reads no project')
+  assert.equal(asked.length, 0, 'explore asks no initialisation question')
+  assert.equal(descriptions.length, 0, 'explore asks for no description')
+  // ...and it does not become a run: the slot is still free.
+  assert.match(control.status().text, /no run is active/)
+})
+
+test('`explore` leaves the run slot free for the next `/taskloop`', async () => {
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(applyFixture('ready.json')),
+  ])
+  const { control, agent } = harness({ createCli: () => cli })
+
+  control.explore(invocation(agent))
+  const result = await control.run(invocation(agent), { change: null })
+
+  // The run took the slot itself, so it neither met a refusal nor found one taken.
+  assert.match(result.text, /^taskloop: OpenSpec root:/)
+  assert.doesNotMatch(result.text, /already active/)
+  assert.equal(cli.calls.length, 3)
+})
+
+test('`explore` works during an active run and leaves that run alone', async () => {
+  let release
+  const idle = new Promise((resolve) => {
+    release = resolve
+  })
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(progressedApply()),
+  ])
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    agent: { whenIdle: () => idle },
+  })
+  const otherMessages = []
+  const otherAgent = {
+    id: 'agent-2',
+    followup(message) {
+      otherMessages.push(message)
+    },
+    async whenIdle() {},
+  }
+
+  const running = control.run(invocation(agent), { change: null })
+  await new Promise((resolve) => setImmediate(resolve))
+  const callsBefore = cli.calls.length
+
+  const result = control.explore(invocation(otherAgent))
+
+  assert.equal(result.kind, 'success')
+  assert.equal(otherMessages.length, 1, 'the other session received the instruction')
+  assert.equal(otherMessages[0].content[0].text, EXPLORE_MODE_PROMPT)
+  assert.equal(messages.length, 1, 'the active run sent its task and nothing else')
+  assert.equal(cli.calls.length, callsBefore, 'the active run was not disturbed')
+  assert.match(control.status().text, /a run for change "add-taskloop-plugin" is active/)
+
+  release()
+  assert.match((await running).text, /sent tasks 2\.3 and 2\.4/)
+})
+
+test('an agent that cannot take a follow-up becomes an error result, not a throw', () => {
+  const { control } = harness({ createCli: () => scriptedCli([]) })
+
+  const result = control.explore(invocation({ id: 'agent-without-followup' }))
+
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /^taskloop: the explore mode message needs an agent that accepts a follow-up/)
+})
+
 test('a cancelled description reports the cancellation and sends nothing', async () => {
   const cli = scriptedCli([cliResult(fixture('empty.json'))])
   const { control, messages, agent } = harness({ createCli: () => cli })
@@ -1436,6 +1766,68 @@ test('a CLI that fails mid-call becomes an error result with its own message', a
   assert.match(result.text, /^taskloop: openspec CLI is not available/)
 })
 
+test('the version gate is settled before the first read of a run', async () => {
+  const cli = scriptedCli([cliResult(fixture('repo.json'))])
+  const { control } = harness({ createCli: () => cli })
+
+  await control.run(invocation(), { change: 'no-such-change' })
+
+  // The gate is asked once, and before the listing: a CLI of the wrong vintage must be
+  // refused without any document being read (9.2, design D20).
+  assert.deepEqual(cli.order, ['version', 'list --json'])
+  assert.equal(cli.versions, 1)
+})
+
+test('a run refuses to start on an openspec older than the minimum, before any read', async () => {
+  // The wrapper is the real one and only the host's subprocess is fake, so the refusal is
+  // the shipped message rather than a restatement of it (9.2, design D20).
+  const spawned = []
+  const subprocess = {
+    async resolveExecutable() {
+      return 'C:\\tools\\openspec.exe'
+    },
+    spawn(spec) {
+      spawned.push(spec.argv)
+      const reader = (text) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
+      return {
+        collected: { stdout: reader('0.9.0\n'), stderr: reader('') },
+        done: Promise.resolve({ exitCode: 0, signal: null }),
+        terminate() {},
+      }
+    },
+  }
+  const cli = new OpenSpecCli(subprocess, { timeoutMs: 120_000 })
+  const { control, messages, agent } = harness({ createCli: () => cli })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /^taskloop: openspec 0\.9\.0 is older than the minimum 0\.14\.0/u)
+  assert.ok(result.text.includes(`update OpenSpec to ${MIN_OPENSPEC_VERSION} or newer`))
+  // The project was never read, the model heard nothing, and the slot is free: a run that
+  // refused its CLI is not a run that later `/taskloop` calls have to wait for.
+  assert.deepEqual(spawned, [['C:\\tools\\openspec.exe', '--version']])
+  assert.equal(messages.length, 0)
+  assert.match(control.status().text, /no run is active/)
+  assert.match((await control.stop()).text, /no run is active/)
+})
+
+test('explore, stop and status never build a CLI, so the version is never read', async () => {
+  const { control, messages, agent } = harness({
+    createCli: () => {
+      throw new Error('the version gate must not run for explore, stop or status')
+    },
+  })
+
+  const explored = control.explore(invocation(agent))
+  assert.equal(explored.kind, 'success')
+  assert.equal(messages.length, 1)
+  assert.equal(messages[0].content[0].text, EXPLORE_MODE_PROMPT)
+
+  assert.match((await control.stop()).text, /no run is active/)
+  assert.match(control.status().text, /no run is active/)
+})
+
 test('a second `/taskloop` from another session is refused while a run is active', async () => {
   // The first run sends 2.3 and stays in its turn until the test releases it.
   let release
@@ -1502,6 +1894,7 @@ test('two runs started at the same moment leave exactly one active', async () =>
   })
   const calls = []
   const cli = {
+    async ensureSupportedVersion() {},
     async run(args, options) {
       calls.push(args)
       if (calls.length === 1) return firstListing
@@ -1586,6 +1979,7 @@ test('a run stopped before its first task reports where it was honestly', async 
   // cancelled call rejects, and the loop must read that as the stop, not as an error.
   const calls = []
   const cli = {
+    async ensureSupportedVersion() {},
     async run(args, options) {
       calls.push({ args, options })
       if (args[1] === 'apply') {

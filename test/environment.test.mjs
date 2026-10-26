@@ -1,14 +1,14 @@
-// Tests for the Cordis-facing seam (tasks 3.1–3.3, 4.2, 5.1–5.3, 6.1, 6.3).
+// Tests for the Cordis-facing seam (tasks 3.1–3.3, 4.2, 5.1–5.3, 6.1, 6.3, 7.3).
 //
 // The seam is small but decisive: which directory `openspec` runs in, which
 // timeout the wrapper gets, whether the confirmation, the description question
 // and the explore follow-up reach the session's services, which services open
 // the session a run continues in at a group boundary, what the two compaction
-// calls send to the service, where the commit message text comes from, whether it
-// is kept and how it is dropped again (design D16), and which argv the commit tool
-// is started with (4.2). A fake context exposes exactly the services the seam
-// reads, so a lookup of the wrong service fails here instead of in a mounted
-// profile.
+// calls send to the service, where the commit input comes from — the message text
+// and, for GitButler, the branch of the run (design D16/D18) — how that input is
+// kept and dropped again, and which argv the commit tool is started with (4.2). A
+// fake context exposes exactly the services the seam reads, so a lookup of the
+// wrong service fails here instead of in a mounted profile.
 
 import assert from 'node:assert/strict'
 import { access, mkdir, mkdtemp, rm } from 'node:fs/promises'
@@ -18,12 +18,14 @@ import { test } from 'node:test'
 
 import { INIT_ANSWER, INIT_LABEL, INIT_QUESTION_ID } from '../lib/bootstrap.js'
 import { COMMIT_END, runCommit } from '../lib/commit.js'
+import { ANCHOR_QUESTION_ID, BRANCH_QUESTION_ID } from '../lib/commit-input.js'
 import { COMMIT_MESSAGE_QUESTION_ID, COMMIT_TEXT } from '../lib/commit-text.js'
 import { resolveConfig } from '../lib/config.js'
 import { createEnvironment, resolveCwd } from '../lib/environment.js'
 import {
   DESCRIPTION_QUESTION_ID,
   EXPLORE_ANSWER,
+  EXPLORE_MODE_PROMPT,
   EXPLORE_SKILL_PATH,
   buildExplorePrompt,
 } from '../lib/explore.js'
@@ -159,6 +161,25 @@ test('the explore follow-up goes to the invocation agent, once', () => {
   assert.equal(messages.length, 1)
   assert.equal(messages[0].role, 'user')
   assert.equal(messages[0].content[0].text, buildExplorePrompt('Ship the export endpoint.', EXPLORE_SKILL_PATH))
+})
+
+test('the explore-mode follow-up goes to the invocation agent, once', () => {
+  const messages = []
+  const environment = createEnvironment(fakeCtx({}), resolveConfig())
+  const invocation = {
+    agent: {
+      id: 'agent-1',
+      followup(message) {
+        messages.push(message)
+      },
+    },
+  }
+
+  environment.followupExploreMode(invocation)
+
+  assert.equal(messages.length, 1)
+  assert.equal(messages[0].role, 'user')
+  assert.equal(messages[0].content[0].text, EXPLORE_MODE_PROMPT)
 })
 
 test('the new session is created in the run workspace and driven through the controller', async () => {
@@ -825,9 +846,9 @@ test('the stored message of a change is used and the question is not asked', asy
     resolveConfig(),
   )
 
-  const outcome = await environment.commitText(
+  const outcome = await environment.commitInput(
     { agent: { id: 'agent-1' }, signal: new AbortController().signal },
-    { change: 'demo', cwd: '/repo' },
+    { change: 'demo', cwd: '/repo', tool: 'git' },
   )
 
   assert.deepEqual(outcome, { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' })
@@ -848,7 +869,7 @@ test('a change without a stored message is asked once and the answer is kept', a
   )
   const invocation = { agent: { id: 'agent-1' }, signal: new AbortController().signal }
 
-  const outcome = await environment.commitText(invocation, { change: 'demo', cwd: '/repo' })
+  const outcome = await environment.commitInput(invocation, { change: 'demo', cwd: '/repo', tool: 'git' })
 
   // Trimmed once, so the run commits with the same string the next run reads back.
   assert.deepEqual(outcome, { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' })
@@ -872,7 +893,7 @@ test('a change without a stored message is asked once and the answer is kept', a
     resolveConfig(),
   )
   assert.deepEqual(
-    await second.commitText(invocation, { change: 'demo', cwd: '/repo' }),
+    await second.commitInput(invocation, { change: 'demo', cwd: '/repo', tool: 'git' }),
     { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' },
   )
 })
@@ -891,12 +912,13 @@ test('a dismissed question is a refusal and stores nothing', async (t) => {
     resolveConfig(),
   )
 
-  const outcome = await environment.commitText(
+  const outcome = await environment.commitInput(
     { agent: { id: 'agent-1' }, signal: new AbortController().signal },
-    { change: 'demo', cwd: '/repo' },
+    { change: 'demo', cwd: '/repo', tool: 'git' },
   )
 
-  assert.deepEqual(outcome, { kind: COMMIT_TEXT.cancelled })
+  // The refusal names the question it was: a dismissed message is not a dismissed branch.
+  assert.deepEqual(outcome, { kind: COMMIT_TEXT.cancelled, step: 'message' })
   // Nothing is kept: the run that would have used the text never started (5.2).
   assert.equal(await readCommitMessage({ home, cwd: '/repo', change: 'demo' }), undefined)
   await assert.rejects(() => access(stateFileOf(home)), /ENOENT/)
@@ -906,9 +928,9 @@ test('a session with no question channel has no message and writes no state', as
   const home = await temporaryHome(t)
   const environment = createEnvironment(fakeCtx({ profileContext: { home } }), resolveConfig())
 
-  const outcome = await environment.commitText(
+  const outcome = await environment.commitInput(
     { agent: { id: 'agent-1' }, signal: new AbortController().signal },
-    { change: 'demo', cwd: '/repo' },
+    { change: 'demo', cwd: '/repo', tool: 'git' },
   )
 
   assert.deepEqual(outcome, { kind: COMMIT_TEXT.unavailable })
@@ -919,9 +941,9 @@ test('a host without a profile home still asks and uses the answer for the run',
   const questions = { async ask() { return messageAnswer('Добавить эндпоинт') } }
   const environment = createEnvironment(fakeCtx({ userQuestions: questions }), resolveConfig())
 
-  const outcome = await environment.commitText(
+  const outcome = await environment.commitInput(
     { agent: { id: 'agent-1' } },
-    { change: 'demo', cwd: '/repo' },
+    { change: 'demo', cwd: '/repo', tool: 'git' },
   )
 
   // Nowhere documented to keep the text: the run commits with the answer, and the next
@@ -947,9 +969,9 @@ test('a state file that cannot be read is reported before the question is asked'
   )
 
   await assert.rejects(
-    () => environment.commitText(
+    () => environment.commitInput(
       { agent: { id: 'agent-1' }, signal: new AbortController().signal },
-      { change: 'demo', cwd: '/repo' },
+      { change: 'demo', cwd: '/repo', tool: 'git' },
     ),
     (error) => error.code === 'EISDIR',
   )
@@ -972,7 +994,7 @@ test('a finished change drops its text, so the next run asks again', async (t) =
   const invocation = { agent: { id: 'agent-1' }, signal: new AbortController().signal }
 
   assert.deepEqual(
-    await environment.commitText(invocation, { change: 'demo', cwd: '/repo' }),
+    await environment.commitInput(invocation, { change: 'demo', cwd: '/repo', tool: 'git' }),
     { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' },
   )
   // A second change of the same project keeps its own record across the deletion.
@@ -995,7 +1017,7 @@ test('a finished change drops its text, so the next run asks again', async (t) =
     resolveConfig(),
   )
   assert.deepEqual(
-    await next.commitText(invocation, { change: 'demo', cwd: '/repo' }),
+    await next.commitInput(invocation, { change: 'demo', cwd: '/repo', tool: 'git' }),
     { kind: COMMIT_TEXT.text, text: 'Следующая задача' },
   )
   assert.equal(asked.length, 2)
@@ -1016,6 +1038,210 @@ test('a host without a profile home has no stored text to drop', async () => {
 
   // Nowhere documented to keep it, so nothing to remove and nothing to fail on.
   await environment.forgetCommitText({ change: 'demo', cwd: '/repo' })
+})
+
+/** A `but status --json` document listing two applied branches (D18). */
+const BUT_STATUS_JSON = JSON.stringify({
+  stacks: [
+    { id: 0, branches: [{ name: 'feature-a', cliId: 'b1' }, { name: 'feature-b', cliId: 'b2' }] },
+  ],
+})
+
+/**
+ * An answer to the one card of a GitButler run: the message and the branch.
+ *
+ * @param {string} [text] - message text the user typed.
+ * @param {object} [branch] - `selected` labels and/or `custom` text for the branch question.
+ * @returns {object} the `ctx.userQuestions` answer.
+ */
+const inputAnswer = (text = 'Добавить эндпоинт', branch = { selected: ['feature-a'] }) => ({
+  answers: [
+    { id: COMMIT_MESSAGE_QUESTION_ID, selected: [], custom: text },
+    { id: BRANCH_QUESTION_ID, selected: branch.selected ?? [], ...(branch.custom === undefined ? {} : { custom: branch.custom }) },
+  ],
+})
+
+test('a GitButler run reads the branches and asks for both halves in one card', async () => {
+  const subprocess = fakeToolSubprocess({
+    executable: '/usr/local/bin/but',
+    spawn: () => handleOf({ stdout: BUT_STATUS_JSON }),
+  })
+  const asked = []
+  const questions = {
+    async ask(request) {
+      asked.push(request)
+      return inputAnswer('Добавить эндпоинт', { selected: ['feature-b'] })
+    },
+  }
+  const environment = createEnvironment(fakeCtx({ subprocess, userQuestions: questions }), resolveConfig())
+  const signal = new AbortController().signal
+
+  const outcome = await environment.commitInput(
+    { agent: { id: 'agent-1' }, signal },
+    { change: 'demo', cwd: '/repo', tool: 'gitbutler' },
+  )
+
+  // One card for the message and the branch, and one read of the listing behind it.
+  assert.equal(asked.length, 1)
+  assert.deepEqual(
+    asked[0].questions.map((question) => question.id),
+    [COMMIT_MESSAGE_QUESTION_ID, BRANCH_QUESTION_ID],
+  )
+  assert.deepEqual(asked[0].questions[1].options.map((option) => option.label), ['feature-a', 'feature-b'])
+  // The listing is an argv request without a shell, in the project directory.
+  assert.equal(subprocess.calls.resolve[0].command, 'but')
+  assert.deepEqual(subprocess.calls.spawn[0].argv, ['/usr/local/bin/but', 'status', '--json'])
+  assert.equal(subprocess.calls.spawn[0].cwd, '/repo')
+  assert.equal(subprocess.calls.spawn[0].signal, signal)
+  assert.deepEqual(outcome, {
+    kind: COMMIT_TEXT.text,
+    text: 'Добавить эндпоинт',
+    branch: { name: 'feature-b', exists: true },
+  })
+})
+
+test('a new branch name asks for its anchor and comes back as a plan to create', async () => {
+  const subprocess = fakeToolSubprocess({
+    executable: '/usr/local/bin/but',
+    spawn: () => handleOf({ stdout: BUT_STATUS_JSON }),
+  })
+  const asked = []
+  const questions = {
+    async ask(request) {
+      asked.push(request)
+      if (asked.length === 1) return inputAnswer('Добавить эндпоинт', { custom: 'feature-c' })
+      return { answers: [{ id: ANCHOR_QUESTION_ID, selected: ['feature-a'] }] }
+    },
+  }
+  const environment = createEnvironment(fakeCtx({ subprocess, userQuestions: questions }), resolveConfig())
+
+  const outcome = await environment.commitInput(
+    { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+    { change: 'demo', cwd: '/repo', tool: 'gitbutler' },
+  )
+
+  assert.equal(asked.length, 2)
+  assert.deepEqual(asked[1].questions.map((question) => question.id), [ANCHOR_QUESTION_ID])
+  // `exists: false` is what makes `but branch new` run at the first non-empty commit.
+  assert.deepEqual(outcome.branch, { name: 'feature-c', anchor: 'feature-a', exists: false })
+})
+
+test('a refused branch question starts nothing and stores nothing', async (t) => {
+  const home = await temporaryHome(t)
+  const subprocess = fakeToolSubprocess({
+    executable: '/usr/local/bin/but',
+    spawn: () => handleOf({ stdout: BUT_STATUS_JSON }),
+  })
+  const questions = {
+    async ask() {
+      return inputAnswer('Добавить эндпоинт', { selected: [] })
+    },
+  }
+  const environment = createEnvironment(
+    fakeCtx({ profileContext: { home }, subprocess, userQuestions: questions }),
+    resolveConfig(),
+  )
+
+  const outcome = await environment.commitInput(
+    { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+    { change: 'demo', cwd: '/repo', tool: 'gitbutler' },
+  )
+
+  assert.deepEqual(outcome, { kind: COMMIT_TEXT.cancelled, step: 'branch' })
+  // The text that came with the refused card is not kept: no run will use it.
+  await assert.rejects(() => access(stateFileOf(home)), /ENOENT/)
+})
+
+test('a failing but status stops the command before the first task and carries the hint', async () => {
+  const subprocess = fakeToolSubprocess({
+    executable: '/usr/local/bin/but',
+    spawn: () => handleOf({ exitCode: 1, stderr: 'fatal: this directory is not a GitButler project\n' }),
+  })
+  const asked = []
+  const questions = {
+    async ask(request) {
+      asked.push(request)
+      return inputAnswer()
+    },
+  }
+  const environment = createEnvironment(fakeCtx({ subprocess, userQuestions: questions }), resolveConfig())
+
+  await assert.rejects(
+    () => environment.commitInput(
+      { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+      { change: 'demo', cwd: '/repo', tool: 'gitbutler' },
+    ),
+    (error) => {
+      assert.match(error.message, /but status --json failed with exit code 1/u)
+      assert.match(error.message, /not a GitButler project/u)
+      assert.match(error.message, /but setup/u)
+      return true
+    },
+  )
+  // The user is not asked anything they could not answer: the run stops here (D18).
+  assert.deepEqual(asked, [])
+})
+
+test('a but status that prints no JSON is a failure, not a project without branches', async () => {
+  const subprocess = fakeToolSubprocess({
+    executable: '/usr/local/bin/but',
+    spawn: () => handleOf({ stdout: 'Logging in…\n' }),
+  })
+  // A question channel, because a listing nobody could be asked about is not read (D18).
+  const questions = { async ask() { return inputAnswer() } }
+  const environment = createEnvironment(fakeCtx({ subprocess, userQuestions: questions }), resolveConfig())
+
+  await assert.rejects(
+    () => environment.commitInput(
+      { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+      { change: 'demo', cwd: '/repo', tool: 'gitbutler' },
+    ),
+    (error) => {
+      // An empty list would mean "create the first branch", which is a very different
+      // thing to do with a project GitButler does not know.
+      assert.match(error.message, /did not print JSON/u)
+      assert.match(error.message, /but setup/u)
+      return true
+    },
+  )
+})
+
+test('a git run reads no branch listing and asks for the message alone', async () => {
+  const subprocess = fakeToolSubprocess()
+  const asked = []
+  const questions = {
+    async ask(request) {
+      asked.push(request)
+      return messageAnswer('Добавить эндпоинт')
+    },
+  }
+  const environment = createEnvironment(fakeCtx({ subprocess, userQuestions: questions }), resolveConfig())
+
+  const outcome = await environment.commitInput(
+    { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+    { change: 'demo', cwd: '/repo', tool: 'git' },
+  )
+
+  assert.deepEqual(outcome, { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' })
+  assert.deepEqual(asked[0].questions.map((question) => question.id), [COMMIT_MESSAGE_QUESTION_ID])
+  // `git` has no branches to choose, so the tool is not started at all before the run.
+  assert.equal(subprocess.calls.spawn.length, 0)
+})
+
+test('a stored message with no question channel reads no listing and names no branch', async (t) => {
+  const home = await temporaryHome(t)
+  await writeCommitMessage({ home, cwd: '/repo', change: 'demo', message: 'Добавить эндпоинт' })
+  const subprocess = fakeToolSubprocess()
+  const environment = createEnvironment(fakeCtx({ profileContext: { home }, subprocess }), resolveConfig())
+
+  const outcome = await environment.commitInput(
+    { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+    { change: 'demo', cwd: '/repo', tool: 'gitbutler' },
+  )
+
+  // The headless fallback of D18: no branch question, so no `but status` to ask from.
+  assert.deepEqual(outcome, { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' })
+  assert.equal(subprocess.calls.spawn.length, 0)
 })
 
 test('a commit line is appended to the session that drove the finished group', async () => {

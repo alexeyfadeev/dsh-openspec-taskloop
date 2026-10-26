@@ -75,7 +75,7 @@ test('apply mounts `/taskloop` without resolving any other service', () => {
 
   assert.equal(registrations.length, 1)
   assert.equal(registrations[0].name, 'taskloop')
-  assert.deepEqual(registrations[0].input, { hint: '[change] | stop | status' })
+  assert.deepEqual(registrations[0].input, { hint: '[change] | stop | status | explore' })
 })
 
 test('apply asks for the settings service instead of looking it up', () => {

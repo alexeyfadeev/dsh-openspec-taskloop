@@ -1,4 +1,4 @@
-// Tests for the `/taskloop` command surface (task 3.1).
+// Tests for the `/taskloop` command surface (tasks 3.1, 8.1).
 //
 // Two things are pinned here: the grammar of the argument (pure, exhaustively
 // covered) and the rule the spec states twice — an argument the command does not
@@ -67,7 +67,12 @@ function fakeControl(result = { kind: 'success' }) {
     return result
   }
   return {
-    control: { run: action(ACTION.run), stop: action(ACTION.stop), status: action(ACTION.status) },
+    control: {
+      run: action(ACTION.run),
+      stop: action(ACTION.stop),
+      status: action(ACTION.status),
+      explore: action(ACTION.explore),
+    },
     calls,
     result,
   }
@@ -86,11 +91,16 @@ test('a single token is the change name', () => {
   assert.deepEqual(parseTaskloopArgs('add-taskloop-plugin '), { kind: ACTION.run, change: 'add-taskloop-plugin' })
 })
 
-test('stop and status are subcommands, not change names', () => {
+test('stop, status and explore are subcommands, not change names', () => {
   assert.deepEqual(parseTaskloopArgs('stop'), { kind: ACTION.stop })
   assert.deepEqual(parseTaskloopArgs('  stop  '), { kind: ACTION.stop })
   assert.deepEqual(parseTaskloopArgs('status'), { kind: ACTION.status })
   assert.deepEqual(parseTaskloopArgs('\tstatus'), { kind: ACTION.status })
+  // `explore` shadows a change of the same name — the accepted trade-off of the
+  // fourth form (design D19), recorded here as behaviour rather than as an
+  // accident: the subcommand wins whenever the whole argument is that word.
+  assert.deepEqual(parseTaskloopArgs('explore'), { kind: ACTION.explore })
+  assert.deepEqual(parseTaskloopArgs('  explore\n'), { kind: ACTION.explore })
 })
 
 test('matches subcommands exactly, so their uppercase spellings stay change names', () => {
@@ -99,10 +109,11 @@ test('matches subcommands exactly, so their uppercase spellings stay change name
   // change, with the list of names to choose from.
   assert.deepEqual(parseTaskloopArgs('STOP'), { kind: ACTION.run, change: 'STOP' })
   assert.deepEqual(parseTaskloopArgs('Status'), { kind: ACTION.run, change: 'Status' })
+  assert.deepEqual(parseTaskloopArgs('Explore'), { kind: ACTION.run, change: 'Explore' })
 })
 
 test('more than one argument is a usage error naming the count', () => {
-  for (const rawInput of ['stop now', 'status extra', 'a b', '  add-auth  please ']) {
+  for (const rawInput of ['stop now', 'status extra', 'explore now', 'a b', '  add-auth  please ']) {
     const parsed = parseTaskloopArgs(rawInput)
     assert.equal(parsed.kind, 'invalid')
     assert.match(parsed.reason, /at most one argument/)
@@ -130,9 +141,9 @@ test('registers the command with its metadata and no attachments', () => {
   assert.equal(typeof definition.handler, 'function')
 })
 
-test('refuses to register without all three actions', () => {
+test('refuses to register without all four actions', () => {
   const { ctx } = fakeContext()
-  for (const missing of [ACTION.run, ACTION.stop, ACTION.status]) {
+  for (const missing of [ACTION.run, ACTION.stop, ACTION.status, ACTION.explore]) {
     const { control } = fakeControl()
     delete control[missing]
     assert.throws(() => registerTaskloopCommand(ctx, control), new RegExp(`control\\.${missing}`))
@@ -192,6 +203,26 @@ test('stop and status reach their own actions', () => {
   assert.deepEqual(calls.map((call) => call[0]), [ACTION.stop, ACTION.status])
   assert.equal(calls[0][1], stopInvocation)
   assert.equal(calls[1][1], statusInvocation)
+})
+
+test('an explore request reaches only the explore action', () => {
+  const { ctx, registrations } = fakeContext()
+  const { control, calls, result } = fakeControl()
+  registerTaskloopCommand(ctx, control)
+  const [{ handler }] = registrations
+
+  const exploreInvocation = invocation(' explore ')
+  assert.equal(handler(exploreInvocation), result)
+
+  // Nothing else is reached: no run is asked for, so the form cannot start one.
+  assert.deepEqual(calls.map((call) => call[0]), [ACTION.explore])
+  assert.equal(calls[0][1], exploreInvocation)
+  assert.equal(calls[0].length, 2, 'explore takes no action options')
+})
+
+test('the usage text names the explore form', () => {
+  assert.match(USAGE, /\/taskloop explore/)
+  assert.match(COMMAND.hint, /explore/)
 })
 
 test('apply mounts the command through an effect', () => {
