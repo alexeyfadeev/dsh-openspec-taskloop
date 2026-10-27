@@ -419,7 +419,7 @@ const BRANCH = { name: 'feature-a', exists: true }
 
 test('GitButler commits into the branch the run selected', () => {
   assert.deepEqual(buildCommitCommands({ tool: 'gitbutler', message: GROUPED, branch: BRANCH }), [
-    { executable: 'but', args: ['commit', 'feature-a', '-m', GROUPED] },
+    { executable: 'but', args: ['commit', '-b', 'feature-a', '-m', GROUPED] },
   ])
 })
 
@@ -430,7 +430,7 @@ test('a new branch is created by name, with its anchor when there is one', () =>
     }),
     [
       { executable: 'but', args: ['branch', 'new', 'feature-b', '-a', 'feature-a'] },
-      { executable: 'but', args: ['commit', 'feature-b', '-m', GROUPED] },
+      { executable: 'but', args: ['commit', '-b', 'feature-b', '-m', GROUPED] },
     ],
   )
   // A project without applied branches has nothing to stack on: no `-a` at all.
@@ -438,7 +438,7 @@ test('a new branch is created by name, with its anchor when there is one', () =>
     buildCommitCommands({ tool: 'gitbutler', message: GROUPED, branch: { name: 'first', exists: false } }),
     [
       { executable: 'but', args: ['branch', 'new', 'first'] },
-      { executable: 'but', args: ['commit', 'first', '-m', GROUPED] },
+      { executable: 'but', args: ['commit', '-b', 'first', '-m', GROUPED] },
     ],
   )
 })
@@ -489,7 +489,7 @@ test('a new branch is created on the first commit and not on the next one', asyn
   // The order is the contract: the tree is checked, the branch created, then committed.
   assert.deepEqual(calls.map((call) => call.name), ['git status', 'but branch', 'but commit'])
   assert.deepEqual(calls[1].args, ['branch', 'new', 'feature-b', '-a', 'feature-a'])
-  assert.deepEqual(calls[2].args, ['commit', 'feature-b', '-m', GROUPED])
+  assert.deepEqual(calls[2].args, ['commit', '-b', 'feature-b', '-m', GROUPED])
   assert.equal(first.kind, COMMIT_END.committed)
   assert.equal(first.branch, 'feature-b')
   assert.equal(branch.exists, true)
@@ -500,7 +500,7 @@ test('a new branch is created on the first commit and not on the next one', asyn
   const second = await runCommit({ tool: 'gitbutler', text: TEXT, range: next, branch, cwd: '/repo', run })
 
   assert.deepEqual(calls.map((call) => call.name), ['git status', 'but commit'])
-  assert.deepEqual(calls[1].args, ['commit', 'feature-b', '-m', 'Добавить эндпоинт. Tasks 2.5 - 2.8'])
+  assert.deepEqual(calls[1].args, ['commit', '-b', 'feature-b', '-m', 'Добавить эндпоинт. Tasks 2.5 - 2.8'])
   assert.equal(second.kind, COMMIT_END.committed)
 })
 

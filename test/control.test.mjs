@@ -1245,7 +1245,7 @@ test('a GitButler run commits into the branch its input named', async () => {
   assert.deepEqual(tool.calls.map((call) => call.name), ['git status', 'but commit'])
   assert.deepEqual(
     tool.calls[1].request.args,
-    ['commit', 'feature-a', '-m', 'Добавить эндпоинт. Tasks 2.1 - 2.4'],
+    ['commit', '-b', 'feature-a', '-m', 'Добавить эндпоинт. Tasks 2.1 - 2.4'],
   )
   assert.match(
     result.text,
@@ -1291,7 +1291,7 @@ test('a new branch is created right before the first commit, and only there', as
   assert.deepEqual(tool.calls[1].request.args, ['branch', 'new', 'feature-x', '-a', 'feature-a'])
   assert.deepEqual(
     tool.calls[2].request.args,
-    ['commit', 'feature-x', '-m', 'Добавить эндпоинт. Tasks 2.1 - 2.4'],
+    ['commit', '-b', 'feature-x', '-m', 'Добавить эндпоинт. Tasks 2.1 - 2.4'],
   )
   // The plan is the run's own memory: `exists` is flipped once the creation went through,
   // so a later group of the same run cannot try to create the branch again.
