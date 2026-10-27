@@ -1048,6 +1048,21 @@ const BUT_STATUS_JSON = JSON.stringify({
 })
 
 /**
+ * A spawn factory for a GitButler run: answers `but --version` with a supported version
+ * (task 3.2) and the branch listing for every other read.
+ *
+ * The version gate sits at the top of the card, so a GitButler test that wants to reach
+ * the branch question first has to get past it. Tests that assert a *refused* version
+ * build their own spawn instead and never reach `status`.
+ *
+ * @param {object} [statusHandle] - handle the `but status --json` read settles with.
+ * @returns {(spec: object) => object} the spawn factory.
+ */
+const butSpawn = (statusHandle = handleOf({ stdout: BUT_STATUS_JSON })) => (spec) => (
+  spec.argv[1] === '--version' ? handleOf({ stdout: 'but 0.22.3\n' }) : statusHandle
+)
+
+/**
  * An answer to the one card of a GitButler run: the message and the branch.
  *
  * @param {string} [text] - message text the user typed.
@@ -1064,7 +1079,7 @@ const inputAnswer = (text = 'Добавить эндпоинт', branch = { sele
 test('a GitButler run reads the branches and asks for both halves in one card', async () => {
   const subprocess = fakeToolSubprocess({
     executable: '/usr/local/bin/but',
-    spawn: () => handleOf({ stdout: BUT_STATUS_JSON }),
+    spawn: butSpawn(),
   })
   const asked = []
   const questions = {
@@ -1090,9 +1105,13 @@ test('a GitButler run reads the branches and asks for both halves in one card', 
   assert.deepEqual(asked[0].questions[1].options.map((option) => option.label), ['feature-a', 'feature-b'])
   // The listing is an argv request without a shell, in the project directory.
   assert.equal(subprocess.calls.resolve[0].command, 'but')
-  assert.deepEqual(subprocess.calls.spawn[0].argv, ['/usr/local/bin/but', 'status', '--json'])
-  assert.equal(subprocess.calls.spawn[0].cwd, '/repo')
-  assert.equal(subprocess.calls.spawn[0].signal, signal)
+  // The version gate answered first (`--version`), then the branch listing.
+  assert.deepEqual(
+    subprocess.calls.spawn.map((spec) => spec.argv.slice(1)),
+    [['--version'], ['status', '--json']],
+  )
+  assert.equal(subprocess.calls.spawn[1].cwd, '/repo')
+  assert.equal(subprocess.calls.spawn[1].signal, signal)
   assert.deepEqual(outcome, {
     kind: COMMIT_TEXT.text,
     text: 'Добавить эндпоинт',
@@ -1103,7 +1122,7 @@ test('a GitButler run reads the branches and asks for both halves in one card', 
 test('a new branch name asks for its anchor and comes back as a plan to create', async () => {
   const subprocess = fakeToolSubprocess({
     executable: '/usr/local/bin/but',
-    spawn: () => handleOf({ stdout: BUT_STATUS_JSON }),
+    spawn: butSpawn(),
   })
   const asked = []
   const questions = {
@@ -1130,7 +1149,7 @@ test('a refused branch question starts nothing and stores nothing', async (t) =>
   const home = await temporaryHome(t)
   const subprocess = fakeToolSubprocess({
     executable: '/usr/local/bin/but',
-    spawn: () => handleOf({ stdout: BUT_STATUS_JSON }),
+    spawn: butSpawn(),
   })
   const questions = {
     async ask() {
@@ -1155,7 +1174,7 @@ test('a refused branch question starts nothing and stores nothing', async (t) =>
 test('a failing but status stops the command before the first task and carries the hint', async () => {
   const subprocess = fakeToolSubprocess({
     executable: '/usr/local/bin/but',
-    spawn: () => handleOf({ exitCode: 1, stderr: 'fatal: this directory is not a GitButler project\n' }),
+    spawn: butSpawn(handleOf({ exitCode: 1, stderr: 'fatal: this directory is not a GitButler project\n' })),
   })
   const asked = []
   const questions = {
@@ -1185,7 +1204,7 @@ test('a failing but status stops the command before the first task and carries t
 test('a but status that prints no JSON is a failure, not a project without branches', async () => {
   const subprocess = fakeToolSubprocess({
     executable: '/usr/local/bin/but',
-    spawn: () => handleOf({ stdout: 'Logging in…\n' }),
+    spawn: butSpawn(handleOf({ stdout: 'Logging in…\n' })),
   })
   // A question channel, because a listing nobody could be asked about is not read (D18).
   const questions = { async ask() { return inputAnswer() } }
@@ -1228,10 +1247,164 @@ test('a git run reads no branch listing and asks for the message alone', async (
   assert.equal(subprocess.calls.spawn.length, 0)
 })
 
+test('a GitButler run with a current version passes the gate and reads the listing', async () => {
+  // The gate's happy path (spec "Версия актуальна"): `0.22.0` itself, the floor, is enough.
+  const subprocess = fakeToolSubprocess({
+    executable: '/usr/local/bin/but',
+    spawn: (spec) => (
+      spec.argv[1] === '--version' ? handleOf({ stdout: 'but 0.22.0\n' }) : handleOf({ stdout: BUT_STATUS_JSON })
+    ),
+  })
+  const questions = { async ask() { return inputAnswer() } }
+  const environment = createEnvironment(fakeCtx({ subprocess, userQuestions: questions }), resolveConfig())
+
+  const outcome = await environment.commitInput(
+    { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+    { change: 'demo', cwd: '/repo', tool: 'gitbutler' },
+  )
+
+  assert.deepEqual(outcome, {
+    kind: COMMIT_TEXT.text,
+    text: 'Добавить эндпоинт',
+    branch: { name: 'feature-a', exists: true },
+  })
+  // The version is read once, before the listing.
+  assert.deepEqual(
+    subprocess.calls.spawn.map((spec) => spec.argv.slice(1)),
+    [['--version'], ['status', '--json']],
+  )
+})
+
+test('a GitButler version below the minimum stops the run with the update advice', async () => {
+  // Spec "Версия ниже минимальной": the command names `0.22.0` and asks to update.
+  const subprocess = fakeToolSubprocess({
+    executable: '/usr/local/bin/but',
+    spawn: (spec) => (
+      spec.argv[1] === '--version' ? handleOf({ stdout: 'but 0.21.0\n' }) : handleOf({ stdout: BUT_STATUS_JSON })
+    ),
+  })
+  const asked = []
+  const questions = {
+    async ask(request) {
+      asked.push(request)
+      return inputAnswer()
+    },
+  }
+  const environment = createEnvironment(fakeCtx({ subprocess, userQuestions: questions }), resolveConfig())
+
+  await assert.rejects(
+    () => environment.commitInput(
+      { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+      { change: 'demo', cwd: '/repo', tool: 'gitbutler' },
+    ),
+    (error) => {
+      assert.match(error.message, /0\.21\.0/u)
+      assert.match(error.message, /0\.22\.0/u)
+      assert.match(error.message, /update GitButler/u)
+      return true
+    },
+  )
+  // Nothing was asked and no listing was read: the gate stopped before the card.
+  assert.deepEqual(asked, [])
+  assert.deepEqual(subprocess.calls.spawn.map((spec) => spec.argv.slice(1)), [['--version']])
+})
+
+test('a but --version that answers no version stops the run unrecognized', async () => {
+  // Spec "Версия не распознана": output without an X.Y.Z stops the run.
+  const subprocess = fakeToolSubprocess({
+    executable: '/usr/local/bin/but',
+    spawn: (spec) => (
+      spec.argv[1] === '--version' ? handleOf({ stdout: 'but: unknown version\n' }) : handleOf({ stdout: BUT_STATUS_JSON })
+    ),
+  })
+  const asked = []
+  const questions = {
+    async ask(request) {
+      asked.push(request)
+      return inputAnswer()
+    },
+  }
+  const environment = createEnvironment(fakeCtx({ subprocess, userQuestions: questions }), resolveConfig())
+
+  await assert.rejects(
+    () => environment.commitInput(
+      { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+      { change: 'demo', cwd: '/repo', tool: 'gitbutler' },
+    ),
+    (error) => {
+      assert.match(error.message, /no X\.Y\.Z version/u)
+      assert.match(error.message, /0\.22\.0/u)
+      assert.match(error.message, /update GitButler/u)
+      return true
+    },
+  )
+  assert.deepEqual(asked, [])
+  assert.deepEqual(subprocess.calls.spawn.map((spec) => spec.argv.slice(1)), [['--version']])
+})
+
+test('a failing but --version stops the run unrecognized with the tool output', async () => {
+  // Spec "Версия не распознана": a command that failed has not confirmed the version (fail-closed).
+  const subprocess = fakeToolSubprocess({
+    executable: '/usr/local/bin/but',
+    spawn: (spec) => (
+      spec.argv[1] === '--version'
+        ? handleOf({ exitCode: 1, stderr: 'but: not found in this shell\n' })
+        : handleOf({ stdout: BUT_STATUS_JSON })
+    ),
+  })
+  const asked = []
+  const questions = {
+    async ask(request) {
+      asked.push(request)
+      return inputAnswer()
+    },
+  }
+  const environment = createEnvironment(fakeCtx({ subprocess, userQuestions: questions }), resolveConfig())
+
+  await assert.rejects(
+    () => environment.commitInput(
+      { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+      { change: 'demo', cwd: '/repo', tool: 'gitbutler' },
+    ),
+    (error) => {
+      assert.match(error.message, /but --version failed with exit code 1/u)
+      assert.match(error.message, /not found in this shell/u)
+      assert.match(error.message, /update GitButler/u)
+      return true
+    },
+  )
+  assert.deepEqual(asked, [])
+})
+
+test('a git run never reads the GitButler version', async () => {
+  // Spec "Проверка не нужна для git": a git commit touches `but` at no point, so the
+  // gate is not even asked. A `but --version` that answers nothing would fail a run
+  // that calls it; here the subprocess is empty and the run is unaffected.
+  const subprocess = fakeToolSubprocess()
+  const asked = []
+  const questions = {
+    async ask(request) {
+      asked.push(request)
+      return messageAnswer('Добавить эндпоинт')
+    },
+  }
+  const environment = createEnvironment(fakeCtx({ subprocess, userQuestions: questions }), resolveConfig())
+
+  const outcome = await environment.commitInput(
+    { agent: { id: 'agent-1' }, signal: new AbortController().signal },
+    { change: 'demo', cwd: '/repo', tool: 'git' },
+  )
+
+  assert.deepEqual(outcome, { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' })
+  assert.equal(asked.length, 1)
+  // No `but --version`, no `but status`: the tool is never started.
+  assert.equal(subprocess.calls.spawn.length, 0)
+})
+
 test('a stored message with no question channel reads no listing and names no branch', async (t) => {
   const home = await temporaryHome(t)
   await writeCommitMessage({ home, cwd: '/repo', change: 'demo', message: 'Добавить эндпоинт' })
-  const subprocess = fakeToolSubprocess()
+  const subprocess = fakeToolSubprocess({ spawn: butSpawn() })
   const environment = createEnvironment(fakeCtx({ profileContext: { home }, subprocess }), resolveConfig())
 
   const outcome = await environment.commitInput(
@@ -1240,8 +1413,10 @@ test('a stored message with no question channel reads no listing and names no br
   )
 
   // The headless fallback of D18: no branch question, so no `but status` to ask from.
+  // The version gate still runs first (task 3.2) — a run that will commit with `but`
+  // must confirm the tool it is about to use, even with nobody to ask a question.
   assert.deepEqual(outcome, { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' })
-  assert.equal(subprocess.calls.spawn.length, 0)
+  assert.deepEqual(subprocess.calls.spawn.map((spec) => spec.argv.slice(1)), [['--version']])
 })
 
 test('a commit line is appended to the session that drove the finished group', async () => {
