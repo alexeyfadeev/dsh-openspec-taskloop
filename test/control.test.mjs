@@ -1288,7 +1288,7 @@ test('a new branch is created right before the first commit, and only there', as
   const result = await control.run(invocation(agent), { change: null })
 
   assert.deepEqual(tool.calls.map((call) => call.name), ['git status', 'but branch', 'but commit'])
-  assert.deepEqual(tool.calls[1].request.args, ['branch', 'new', 'feature-x', '-a', 'feature-a'])
+  assert.deepEqual(tool.calls[1].request.args, ['branch', 'new', 'feature-x', '-A', 'feature-a'])
   assert.deepEqual(
     tool.calls[2].request.args,
     ['commit', '-b', 'feature-x', '-m', 'Добавить эндпоинт. Tasks 2.1 - 2.4'],

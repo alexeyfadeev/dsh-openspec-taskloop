@@ -80,7 +80,7 @@ question — the applied branch it stacks on. A project with no applied branch a
 branch cannot be stacked. The choice lives for one run only and is never written down: a branch topology changes
 faster than a sentence about the work, and a remembered name would be a new kind of failure at the first commit.
 
-Nothing is created while you answer: `but branch new <name> [-a <anchor>]` runs right before the first commit of the
+Nothing is created while you answer: `but branch new <name> [-A <anchor>]` runs right before the first commit of the
 run that has something to commit, after the status check, so a run whose tree turns out empty leaves no empty branch
 behind, and switching **Commit tool** to `git` in the middle of the run leaves no orphan either. The commits then name
 the branch (`but commit <branch> -m`), and both the report and the `commit <id>` line say where the history moved. A

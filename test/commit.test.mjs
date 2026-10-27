@@ -429,11 +429,11 @@ test('a new branch is created by name, with its anchor when there is one', () =>
       tool: 'gitbutler', message: GROUPED, branch: { name: 'feature-b', anchor: 'feature-a', exists: false },
     }),
     [
-      { executable: 'but', args: ['branch', 'new', 'feature-b', '-a', 'feature-a'] },
+      { executable: 'but', args: ['branch', 'new', 'feature-b', '-A', 'feature-a'] },
       { executable: 'but', args: ['commit', '-b', 'feature-b', '-m', GROUPED] },
     ],
   )
-  // A project without applied branches has nothing to stack on: no `-a` at all.
+  // A project without applied branches has nothing to stack on: no `-A` at all.
   assert.deepEqual(
     buildCommitCommands({ tool: 'gitbutler', message: GROUPED, branch: { name: 'first', exists: false } }),
     [
@@ -488,7 +488,7 @@ test('a new branch is created on the first commit and not on the next one', asyn
 
   // The order is the contract: the tree is checked, the branch created, then committed.
   assert.deepEqual(calls.map((call) => call.name), ['git status', 'but branch', 'but commit'])
-  assert.deepEqual(calls[1].args, ['branch', 'new', 'feature-b', '-a', 'feature-a'])
+  assert.deepEqual(calls[1].args, ['branch', 'new', 'feature-b', '-A', 'feature-a'])
   assert.deepEqual(calls[2].args, ['commit', '-b', 'feature-b', '-m', GROUPED])
   assert.equal(first.kind, COMMIT_END.committed)
   assert.equal(first.branch, 'feature-b')

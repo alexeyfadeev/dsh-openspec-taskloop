@@ -7,8 +7,8 @@
 
 ## 2. Синтаксис but branch new
 
-- [ ] 2.1 Обновить `branchNewCommand` в `lib/commit.js`: строить `['branch', 'new', <имя>, '-A', <anchor>]` вместо `-a <anchor>`; при отсутствии anchor оставлять `['branch', 'new', <имя>]`
-- [ ] 2.2 Обновить `test/commit.test.mjs`: ожидания argv для `but branch new <имя> -A <anchor>` и без anchor, и проверить, что `npm test` проходит
+- [x] 2.1 Обновить `branchNewCommand` в `lib/commit.js`: строить `['branch', 'new', <имя>, '-A', <anchor>]` вместо `-a <anchor>`; при отсутствии anchor оставлять `['branch', 'new', <имя>]`
+- [x] 2.2 Обновить `test/commit.test.mjs`: ожидания argv для `but branch new <имя> -A <anchor>` и без anchor, и проверить, что `npm test` проходит
 
 ## 3. Проверка минимальной версии GitButler
 

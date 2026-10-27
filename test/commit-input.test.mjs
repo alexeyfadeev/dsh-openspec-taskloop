@@ -256,7 +256,7 @@ test('the anchor question offers the applied branches a new branch can stack on'
   assert.match(question.question, /feature-c/u)
   assert.deepEqual(question.options.map((option) => option.label), BRANCHES)
   // What the answer creates is the pair name + anchor, at the first commit.
-  assert.match(question.detail, /but branch new feature-c -a <anchor>/u)
+  assert.match(question.detail, /but branch new feature-c -A <anchor>/u)
   assert.match(question.detail, /first commit/u)
   assert.match(question.detail, /Cancelling starts no run/u)
 })
