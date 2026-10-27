@@ -58,7 +58,9 @@ setting turns the whole step off.
 
 A finished group is then committed — by the plugin, not by the model, through the tool in the **Commit tool**
 setting. `Git` stages the whole working tree (`git add -A`) and then runs `git commit -m`; `GitButler` runs
-`but commit <branch> -m`, so that it commits into the branch chosen at the start of the run. Before either, the run
+`but commit -b <branch> -m`, so that it commits into the branch chosen at the start of the run. GitButler
+0.22.0 or newer is required: the run reads `but --version` once, in the GitButler input card, and refuses to
+start if the installed CLI is below that floor or does not answer with a recognizable version. Before either, the run
 checks `git status --porcelain`, so a tree with no changes is not an error: nothing is committed and the report says
 there was nothing to commit, which is also the answer when you committed by hand first. The message is passed as one
 argv element rather than a command line, so quotes, spaces and line breaks inside it stay part of the message and can
@@ -83,7 +85,7 @@ faster than a sentence about the work, and a remembered name would be a new kind
 Nothing is created while you answer: `but branch new <name> [-A <anchor>]` runs right before the first commit of the
 run that has something to commit, after the status check, so a run whose tree turns out empty leaves no empty branch
 behind, and switching **Commit tool** to `git` in the middle of the run leaves no orphan either. The commits then name
-the branch (`but commit <branch> -m`), and both the report and the `commit <id>` line say where the history moved. A
+the branch (`but commit -b <branch> -m`), and both the report and the `commit <id>` line say where the history moved. A
 `but status --json` that fails — a directory GitButler does not know yet, a `but` that is not on `PATH` — stops the
 command before the first task, with the tool's own words and a hint about `but setup`, instead of failing at the end of
 the first group after the work was done; dismissing the branch or anchor question starts nothing at all. A deployment
@@ -151,7 +153,7 @@ own configuration block. Seven rows:
 | What the page shows | Field | Default | What it turns on |
 | --- | --- | --- | --- |
 | Commit after each task group | `commit.enabled` | on | Commit the working tree once the last task of a group is verified, using the message given at the start of the run plus the task range of the group. |
-| Commit tool | `commit.tool` | Git | `git` (`git add -A`, then `git commit -m`) or GitButler's `but commit <branch> -m`, which asks for the branch — a new name also asks what it stacks on — at the start of each run. Read at the moment of the commit, so the tool can be switched without restarting a run. |
+| Commit tool | `commit.tool` | Git | `git` (`git add -A`, then `git commit -m`) or GitButler's `but commit -b <branch> -m`, which asks for the branch — a new name also asks what it stacks on — at the start of each run and needs GitButler 0.22.0 or newer. Read at the moment of the commit, so the tool can be switched without restarting a run. |
 | Code review after each task group | `review.enabled` | on | Review the finished group in a session of its own, before the next group starts and before the commit. |
 | Pause after each task group | `pause.enabled` | off | End the run on the group boundary instead of handing the next group a session of its own: review and commit still run, then the report names the closed group and the task the next `/taskloop` continues from. |
 | Compact inside a task | `compaction.midTask` | off | Ask for compaction by context pressure on a step boundary, not only between tasks. |
