@@ -14,7 +14,7 @@
 //     DOM, and the primitives become marker elements the test can find.
 //
 // What the tests pin: the page reaches the shell's `settings.section` list under
-// the id and order design D12 fixes, it shows the six values the config holds, each
+// the id and order design D12 fixes, it shows the seven values the config holds, each
 // control writes its own field through the shared `configForms` entry with no Save
 // button in between, and — the last test — every row the page renders is named in
 // the README the way the page names it (task 2.4).
@@ -37,6 +37,7 @@ const CONFIG_ENTRY = 'openspec-taskloop'
 const VALUE = {
   commit: { enabled: false, tool: 'gitbutler' },
   review: { enabled: false },
+  pause: { enabled: true },
   compaction: { midTask: true, onFailure: 'continue' },
   protocol: { systemSection: true },
 }
@@ -319,17 +320,18 @@ test('apply mounts the page into settings.section under the designed identity', 
   assert.match(page.effects[0], /settings page/u, 'the effect is named for what it owns')
 })
 
-test('the page shows the six settings the config holds', () => {
+test('the page shows the seven settings the config holds', () => {
   const page = mount(createForm({ status: 'ready', writable: true, value: VALUE }))
   const nodes = page.render()
   const switches = switchesOf(nodes)
   const segments = segmentsOf(nodes)
 
-  assert.equal(switches.length, 4, 'four settings are switches')
+  assert.equal(switches.length, 5, 'five settings are switches')
   assert.equal(segments.length, 2, 'two settings are choices')
 
   assert.equal(controlLabelled(switches, 'Commit after each task group').props.checked, false)
   assert.equal(controlLabelled(switches, 'Code review after each task group').props.checked, false)
+  assert.equal(controlLabelled(switches, 'Pause after each task group').props.checked, true)
   assert.equal(controlLabelled(switches, 'Compact inside a task').props.checked, true)
   assert.equal(controlLabelled(switches, 'Protocol section').props.checked, true)
 
@@ -354,6 +356,7 @@ test('each control writes its own field, with no Save button in between', async 
   controlLabelled(switchesOf(nodes), 'Commit after each task group').props.onChange(true)
   controlLabelled(segmentsOf(nodes), 'Commit tool').props.onChange('git')
   controlLabelled(switchesOf(nodes), 'Code review after each task group').props.onChange(true)
+  controlLabelled(switchesOf(nodes), 'Pause after each task group').props.onChange(false)
   controlLabelled(switchesOf(nodes), 'Compact inside a task').props.onChange(false)
   controlLabelled(segmentsOf(nodes), 'When the compaction budget runs out').props.onChange('break')
   controlLabelled(switchesOf(nodes), 'Protocol section').props.onChange(false)
@@ -363,10 +366,35 @@ test('each control writes its own field, with no Save button in between', async 
     [{ op: 'set', path: ['commit', 'enabled'], value: true }],
     [{ op: 'set', path: ['commit', 'tool'], value: 'git' }],
     [{ op: 'set', path: ['review', 'enabled'], value: true }],
+    [{ op: 'set', path: ['pause', 'enabled'], value: false }],
     [{ op: 'set', path: ['compaction', 'midTask'], value: false }],
     [{ op: 'set', path: ['compaction', 'onFailure'], value: 'break' }],
     [{ op: 'set', path: ['protocol', 'systemSection'], value: false }],
   ], 'every control writes exactly its own field, in the order it was used')
+})
+
+test('the pause row is the seventh setting, and writes pause.enabled', async () => {
+  const form = createForm({ status: 'ready', writable: true, value: VALUE })
+  const page = mount(form)
+
+  const labels = switchesOf(page.render()).map((node) => node.props.label)
+  assert.deepEqual(labels, [
+    'Commit after each task group',
+    'Code review after each task group',
+    'Pause after each task group',
+    'Compact inside a task',
+    'Protocol section',
+  ], 'the pause row sits right after code review and ahead of compaction (D12)')
+
+  controlLabelled(switchesOf(page.render()), 'Pause after each task group').props.onChange(false)
+  await settle()
+  assert.deepEqual(form.writes, [
+    [{ op: 'set', path: ['pause', 'enabled'], value: false }],
+  ], 'the pause switch writes pause.enabled and nothing else')
+
+  form.set({ value: { ...VALUE, pause: { enabled: false } } })
+  const after = controlLabelled(switchesOf(page.render()), 'Pause after each task group')
+  assert.equal(after.props.checked, false, 'a value changed elsewhere reaches this row without a reload')
 })
 
 test('the page follows the form, so a value changed elsewhere lands without a reload', () => {
@@ -434,7 +462,7 @@ test('the README names every settings row the way the page shows it', () => {
 
   const labels = [...switchesOf(page.render()), ...segmentsOf(page.render())]
     .map((node) => node.props.label)
-  assert.equal(labels.length, 6, 'the page has six settings, so the README documents six')
+  assert.equal(labels.length, 7, 'the page has seven settings, so the README documents seven')
   for (const label of labels) {
     assert.ok(readme.includes(label), `the README must name the row "${label}" exactly as the page does`)
   }

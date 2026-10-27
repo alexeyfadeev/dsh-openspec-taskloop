@@ -726,6 +726,137 @@ test('a finished group is committed after its review, with the message as one ar
   )
 })
 
+test('a run asked to pause ends at the group boundary and opens no session for the next one', async () => {
+  // 2.4's turn closes group 2. With the pause on (10.4, design D21) the boundary still
+  // reviews and commits the group — the pause is the last step of that boundary, not a
+  // branch around it — and only then ends the run, instead of opening the session that
+  // would take group 3.
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+  ])
+  const events = []
+  const tool = scriptedCommitTool({
+    'git status': toolOk(' M lib/control.js\n'),
+    'git add': toolOk(),
+    'git commit': toolOk('[main 1a2b3c4] Добавить эндпоинт. Tasks 2.1 - 2.4\n 2 files changed, 40 insertions(+)\n'),
+  }, events)
+  const opened = []
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    config: { pause: { enabled: true } },
+    commitInput: async () => {
+      events.push('text')
+      return { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }
+    },
+    runCommitCommand: tool.run,
+    openSession: async (invocation, context) => {
+      events.push(context.range === undefined ? 'open group' : 'open review')
+      const sessionId = context.range === undefined ? 'session-2' : 'review-1'
+      opened.push(sessionId)
+      return { sessionId, followup() {}, async whenIdle() {} }
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  // The whole boundary ran, in order, and the pause came after the commit: the session
+  // of group 3 was never even asked for.
+  assert.deepEqual(events, ['text', 'open review', 'git status', 'git add', 'git commit'])
+  assert.deepEqual(opened, ['review-1'])
+  // The run ended rather than waiting in the slot: the next `/taskloop` starts a run.
+  assert.match(control.status().text, /no run is active/u)
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /sent tasks 2\.3 and 2\.4/u)
+  // Three sentences of one boundary: the group, what became of its commit, and where
+  // the next `/taskloop` continues (design D21).
+  assert.match(result.text, /The commit of tasks 2\.1 - 2\.4 through git went through/u)
+  assert.match(
+    result.text,
+    /The run paused after tasks 2\.1 - 2\.4: no further task was sent, and \/taskloop continues with task 3\.1\./u,
+  )
+  assert.doesNotMatch(result.text, /The run moved to/u)
+  // 3.1 was never sent: both messages are the tasks of the group that closed.
+  assert.equal(messages.length, 2)
+  assert.equal(cli.calls.length, 4, 'no reading followed the pause')
+})
+
+test('a pause needs no commit switch: the boundary alone ends the run', async () => {
+  // The pause is a setting of its own (10.4): a run with reviews and commits off still
+  // has group boundaries, and the hook exists for them. Without it the loop would open
+  // the session of group 3 exactly as it did before the setting existed.
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+  ])
+  const opened = []
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    config: { review: { enabled: false }, commit: { enabled: false }, pause: { enabled: true } },
+    commitInput: async () => {
+      throw new Error('a run with commits off must not ask for a commit message')
+    },
+    openSession: async (invocation, context) => {
+      opened.push(context)
+      return { sessionId: 'session-2', followup() {}, async whenIdle() {} }
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  assert.deepEqual(opened, [])
+  assert.equal(messages.length, 2)
+  assert.match(
+    result.text,
+    /The run paused after tasks 2\.1 - 2\.4: no further task was sent, and \/taskloop continues with task 3\.1\./u,
+  )
+  // Nothing was reviewed or committed, so the report claims neither.
+  assert.doesNotMatch(result.text, /The review of/u)
+  assert.doesNotMatch(result.text, /The commit of/u)
+})
+
+test('a group whose commit has no message text still pauses after its turn', async () => {
+  // A pause is not a reward for a commit that went through: the group is closed either
+  // way, and the skip already has a sentence of its own (5.2). The run therefore ends at
+  // the boundary rather than opening the next group's session over an uncommitted tree.
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({})
+  const opened = []
+  const { control, agent } = harness({
+    createCli: () => cli,
+    config: { review: { enabled: false }, pause: { enabled: true } },
+    runCommitCommand: tool.run,
+    openSession: async (invocation, context) => {
+      opened.push(context)
+      return { sessionId: 'session-2', followup() {}, async whenIdle() {} }
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  assert.deepEqual(tool.calls, [])
+  assert.deepEqual(opened, [])
+  assert.match(
+    result.text,
+    /The commit of tasks 2\.1 - 2\.4 was skipped: the run has no commit message text\./u,
+  )
+  assert.match(result.text, /The run paused after tasks 2\.1 - 2\.4/u)
+})
+
 test('the session that drove the group gets the commit id as soon as the tool commits', async () => {
   const both = tickedApply([12, 13])
   const cli = scriptedCli([

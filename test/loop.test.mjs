@@ -845,6 +845,10 @@ test('a completed intermediate group is announced before the next group is opene
   // The group names the recipient that drove it, so an action taken at the boundary
   // (the commit, 4.3) can speak in the session whose transcript the group is in.
   assert.equal(completed[0].agent, agent)
+  // The hook answered `closed`, which is what a run with the pause off answers at every
+  // boundary (10.3): group 3 still opens a session of its own and takes 3.1 there.
+  assert.equal('pause' in outcome, false)
+  assert.deepEqual(outcome.sessions.map((session) => [session.sessionId, session.task.line]), [['session-2', 17]])
   // The break between 2.3 and 2.4 is not a group end, and the announcement comes
   // after verification but before the next group's session exists (design D13).
   assert.deepEqual(events, [
@@ -1000,4 +1004,113 @@ test('a commit the group hook could not close stops the run at the boundary', as
   // Nothing followed the group: no reading, no session for 3.1, no message.
   assert.deepEqual(events, ['read', 'followup 2.3', 'idle', 'read', 'followup 2.4', 'idle', 'read', 'group'])
   assert.equal(messages.length, 2)
+})
+
+test('a group the hook pauses at ends the run before the next session exists', async () => {
+  // 2.4's turn closes group 2 while group 3 still has tasks: with the pause on, the
+  // boundary is where the run ends, not where a session is opened (10.3, design D21).
+  const both = tickedDocument([12, 13])
+  const { messages, events, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(tickedDocument([12])),
+    cliResult(both),
+  ])
+  const completed = []
+
+  const outcome = await loop({
+    onGroupComplete: (context) => {
+      completed.push(context)
+      events.push('group')
+      return { kind: GROUP_END.paused }
+    },
+    openSession: async () => {
+      events.push('open')
+      throw new Error('the next group must not open a session when the run pauses')
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.paused)
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12, 13])
+  // The report names the group that closed and the task the next `/taskloop` continues
+  // from: the pause was decided against the selection, after the announcement.
+  assert.deepEqual(outcome.pause.range, { from: '2.1', to: '2.4' })
+  assert.equal(outcome.pause.next.line, 17)
+  assert.equal(completed.length, 1)
+  assert.deepEqual(events, ['read', 'followup 2.3', 'idle', 'read', 'followup 2.4', 'idle', 'read', 'group'])
+  assert.equal(messages.length, 2)
+})
+
+test('a pause the hook asks for at the final group still ends the run as complete', async () => {
+  // A boundary with nothing left to run is not a pause: the final group of the change
+  // ends the run as complete, and the report never offers a continuation (10.3, D21).
+  const { events, loop } = harness([
+    cliResult(documentWithOnly(40)),
+    cliResult(completedDocument()),
+  ])
+  const completed = []
+
+  const outcome = await loop({
+    onGroupComplete: (context) => {
+      completed.push(context)
+      events.push('group')
+      return { kind: GROUP_END.paused }
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.completed)
+  assert.equal(completed.length, 1)
+  assert.deepEqual(completed[0].range, { from: '7.1', to: '7.3' })
+  // Nothing was left to continue, so the run did not pause — it finished.
+  assert.equal('pause' in outcome, false)
+  assert.deepEqual(events, ['read', 'followup 7.1', 'idle', 'read', 'group'])
+})
+
+test('a flat run that closes its only group completes instead of pausing', async () => {
+  // A flat list has one group — the whole list — and it closes only when nothing is
+  // left unchecked, so there is never a task to leave for the next run (10.3, D21).
+  const flat = flatDocument()
+  const { loop } = harness([
+    cliResult(onlyLineUndone(flat, 5)),
+    cliResult(completedIn(flat)),
+  ])
+  const completed = []
+
+  const outcome = await loop({
+    onGroupComplete: (context) => {
+      completed.push(context)
+      return { kind: GROUP_END.paused }
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.completed)
+  assert.equal(completed.length, 1)
+  assert.equal(completed[0].range, undefined)
+  assert.equal('pause' in outcome, false)
+})
+
+test('a refused commit outranks the pause the same boundary would allow', async () => {
+  // The hook answers one thing, and a failed commit is that answer: group 3 is still
+  // waiting, yet the run ends as `commit`, not `paused` (10.3, design D21).
+  const both = tickedDocument([12, 13])
+  const { loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(tickedDocument([12])),
+    cliResult(both),
+  ])
+  const failure = {
+    tool: 'git',
+    message: 'Добавить эндпоинт. Tasks 2.1 - 2.4',
+    exitCode: 1,
+    reason: 'nothing to commit, working tree clean',
+  }
+
+  const outcome = await loop({
+    onGroupComplete: () => ({ kind: GROUP_END.commit, commit: failure }),
+  })
+
+  assert.equal(outcome.kind, LOOP_END.commit)
+  assert.deepEqual(outcome.commit, failure)
+  assert.equal('pause' in outcome, false)
+  // There was a task to pause for, so priority settled the run, not the boundary.
+  assert.equal(outcome.instructions.tasks.some((task) => task.line === 17 && !task.done), true)
 })
