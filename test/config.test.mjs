@@ -14,6 +14,9 @@
 // which D12 moved to volatile without changing their defaults or their meaning.
 // The `pause` switch (D21) joins them: volatile, off by default, and documented
 // in the same `config-defaults` block rather than in the base contract.
+// `add-compaction-retry-settings` (D1) turns `retry.attempts`, `retry.delayMs` and
+// `retry.factor` volatile too, but deliberately not `retry.codes` or
+// `retry.maxDelayMs` — those two must keep no page row at all.
 
 import assert from 'node:assert/strict'
 import { readdirSync, readFileSync } from 'node:fs'
@@ -26,6 +29,11 @@ import {
   DEFAULT_MID_TASK,
   DEFAULT_ON_FAILURE,
   DEFAULT_PROTOCOL_SYSTEM_SECTION,
+  DEFAULT_RETRY_ATTEMPTS,
+  DEFAULT_RETRY_CODES,
+  DEFAULT_RETRY_DELAY_MS,
+  DEFAULT_RETRY_FACTOR,
+  DEFAULT_RETRY_MAX_DELAY_MS,
   resolveConfig,
 } from '../lib/config.js'
 
@@ -69,6 +77,25 @@ function plain(value) {
  */
 function isPlainObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Collect the config paths that resolve to a volatile reference.
+ *
+ * This is the question the settings form asks of a resolved config: a reference
+ * is a field the page can show and write, a plain value is not. So the paths
+ * returned here are exactly the rows the page would offer for the subtree, and an
+ * empty result is the test's way of saying "no row under this key".
+ *
+ * @param {unknown} value - resolved config value.
+ * @param {string[]} [prefix] - path segments leading to `value`.
+ * @returns {string[]} dotted paths of the references found.
+ */
+function volatilePaths(value, prefix = []) {
+  if (isVolatileRef(value)) return [prefix.join('.')]
+  if (!isPlainObject(value)) return []
+  return Object.entries(value)
+    .flatMap(([key, item]) => volatilePaths(item, [...prefix, key]))
 }
 
 /**
@@ -265,13 +292,50 @@ test('retry values are bounded by the schema', () => {
   const configured = resolveConfig({
     compaction: { retry: { attempts: 1, delayMs: 0, factor: 1.5, maxDelayMs: 0, codes: ['busy'] } },
   })
-  assert.deepEqual(configured.compaction.retry, {
+  // The three numbers are references now (D1), so compare what they read.
+  assert.deepEqual(plain(configured.compaction.retry), {
     attempts: 1,
     delayMs: 0,
     factor: 1.5,
     maxDelayMs: 0,
     codes: ['busy'],
   })
+})
+
+test('the three retry numbers are volatile, codes and the ceiling are not (D1)', () => {
+  const retry = resolveConfig().compaction.retry
+
+  // Exactly three page rows, and none under `codes` or `maxDelayMs`: the settings
+  // form is built from volatile leaves, so this set is what the page can write.
+  assert.deepEqual(volatilePaths(retry).sort(), ['attempts', 'delayMs', 'factor'])
+
+  assert.ok(isVolatileRef(retry.attempts), 'compaction.retry.attempts must be volatile')
+  assert.ok(isVolatileRef(retry.delayMs), 'compaction.retry.delayMs must be volatile')
+  assert.ok(isVolatileRef(retry.factor), 'compaction.retry.factor must be volatile')
+
+  // Volatile changes where the value is read from, not what it is: the documented
+  // defaults still resolve, now behind a reference.
+  assert.equal(retry.attempts.get(), DEFAULT_RETRY_ATTEMPTS)
+  assert.equal(retry.delayMs.get(), DEFAULT_RETRY_DELAY_MS)
+  assert.equal(retry.factor.get(), DEFAULT_RETRY_FACTOR)
+
+  // Plain fields, kept out of the page on purpose: `codes` is the service's own
+  // list of transient codes, and `maxDelayMs` is a profile-level brake (D1).
+  assert.equal(isVolatileRef(retry.codes), false, 'compaction.retry.codes must stay plain')
+  assert.equal(isVolatileRef(retry.maxDelayMs), false, 'compaction.retry.maxDelayMs must stay plain')
+  assert.deepEqual(retry.codes, [...DEFAULT_RETRY_CODES])
+  assert.equal(retry.maxDelayMs, DEFAULT_RETRY_MAX_DELAY_MS)
+
+  // A profile value reaches the same leaf: the reference reads what was configured.
+  const configured = resolveConfig({
+    compaction: { retry: { attempts: 2, delayMs: 5000, factor: 3, maxDelayMs: 8000, codes: ['busy'] } },
+  })
+  assert.deepEqual(volatilePaths(configured.compaction.retry).sort(), ['attempts', 'delayMs', 'factor'])
+  assert.equal(configured.compaction.retry.attempts.get(), 2)
+  assert.equal(configured.compaction.retry.delayMs.get(), 5000)
+  assert.equal(configured.compaction.retry.factor.get(), 3)
+  assert.equal(configured.compaction.retry.maxDelayMs, 8000)
+  assert.deepEqual(configured.compaction.retry.codes, ['busy'])
 })
 
 test('the mid-task gate and the protocol section stay off unless switched on', () => {

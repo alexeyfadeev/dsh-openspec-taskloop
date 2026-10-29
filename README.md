@@ -169,8 +169,9 @@ landed.
 survive a summary taken mid-task: on its own it describes a run that is bounded only between tasks, which is
 already the case without it.
 
-The page is the plugin's only place for these seven values; the rest of the block below is a profile decision. And
-because the page is this plugin's own, there is no second, generated copy of it under Settings → Plugins.
+The page is the plugin's only place for these seven values, and the three retry numbers sit on it for the same
+reason. The rest of the block below is a profile decision. And because the page is this plugin's own, there is no
+second, generated copy of it under Settings → Plugins.
 
 ## Configuration
 
@@ -189,10 +190,10 @@ because the page is this plugin's own, there is no second, generated copy of it 
       midTask: false               # Compact inside a task
       onFailure: break             # continue | break
       retry:                       # the budget above: attempts counts the first call too
-        attempts: 3
-        delayMs: 1000
-        factor: 2
-        maxDelayMs: 10000
+        attempts: 4
+        delayMs: 40000             # ms to wait after the first failed call
+        factor: 1.5                # every further wait is this many times the previous one
+        maxDelayMs: 0              # 0: no ceiling on a single wait
         codes: [summary, persistence, busy]
     protocol:
       systemSection: false         # Protocol section
@@ -201,8 +202,17 @@ because the page is this plugin's own, there is no second, generated copy of it 
 ```
 
 The seven fields the page edits are volatile: they are read when they apply, so a change is picked up by the next
-run. `change`, `compaction.retry.*` and `openspec.timeoutMs` are not, and are edited here or not at all — the
-retry parameters only make sense together with the policy that spends them.
+run. `compaction.retry.attempts`, `delayMs` and `factor` are volatile too, and are read at the start of every
+transition between tasks rather than once when the plugin is created — another provider means another quota window,
+so these three numbers belong to the page. `compaction.retry.codes` and `compaction.retry.maxDelayMs` stay in the
+profile, edited here or not at all: the transient codes describe the compaction service rather than a preference,
+and the ceiling is the brake for a profile that pairs many attempts with a large factor. `change` and
+`openspec.timeoutMs` are profile decisions as well.
+
+A `maxDelayMs` of `0` — the default — means no ceiling: waits grow by `factor` and are bounded only by the budget,
+so the defaults wait 40 s, then 60 s, then 90 s before a fourth and last call. A positive value caps a single wait,
+but never below `delayMs`: a 40 s base with a 10 s ceiling still waits 40 s, instead of turning the setting you
+just made into a quarter of itself.
 
 `onFailure` accepts `break` and `continue`, `tool` accepts `git` and `gitbutler`; anything else is rejected when
 the profile is loaded, with the offending path. The retry codes are the transient `compactNow` failures only:
