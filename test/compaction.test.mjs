@@ -4,7 +4,8 @@
 // failure is retried with a growing delay, a terminal one is not retried at all,
 // and the budget is counted in calls to `compactNow` rather than in retries. The
 // clock is a recording `sleep`, so the assertions cost no wall-clock time and can
-// pin the exact delays a real run would wait — including the configured ceiling.
+// pin the exact delays a real run would wait — the default no-ceiling schedule and
+// the configured ceiling alike.
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
@@ -61,13 +62,36 @@ function recordedSleep(delays) {
 }
 
 /**
- * The resolved retry configuration, with the given fields overridden.
+ * The plain value behind a configuration leaf.
+ *
+ * @param {unknown} value - resolved config value.
+ * @returns {unknown} the value a volatile reference points at, or the value itself.
+ */
+function readValue(value) {
+  return typeof value?.get === 'function' ? value.get() : value
+}
+
+/**
+ * The retry configuration a caller hands to `compactBetweenTasks`, with the given
+ * fields overridden.
+ *
+ * `attempts`, `delayMs` and `factor` are volatile since design D1, so a resolved
+ * config holds references for them, while `compactBetweenTasks` takes plain
+ * numbers — hence the read here, the same one its caller makes.
  *
  * @param {object} [overrides] - `compaction.retry` fields.
- * @returns {object} resolved retry block.
+ * @returns {object} plain retry block.
  */
-const retryConfig = (overrides = {}) =>
-  resolveConfig({ compaction: { retry: overrides } }).compaction.retry
+const retryConfig = (overrides = {}) => {
+  const retry = resolveConfig({ compaction: { retry: overrides } }).compaction.retry
+  return {
+    attempts: readValue(retry.attempts),
+    delayMs: readValue(retry.delayMs),
+    factor: readValue(retry.factor),
+    maxDelayMs: retry.maxDelayMs,
+    codes: [...retry.codes],
+  }
+}
 
 test('a successful compaction is one call and no delay', async () => {
   const calls = []
@@ -129,6 +153,31 @@ test('the attempt budget ends the transition when every call fails', async () =>
   assert.equal(calls.length, 3, 'the budget counts calls, not retries')
 })
 
+test('the attempt budget is fixed when the transition starts', async () => {
+  const calls = []
+  const delays = []
+  const retry = retryConfig({ attempts: 2, delayMs: 1000, factor: 1 })
+
+  const result = await compactBetweenTasks({
+    compactNow: async () => {
+      calls.push('attempt')
+      // A settings change between attempts must not stretch this transition: the
+      // budget was computed on entry (design D5).
+      retry.attempts = 5
+      throw failure('summary')
+    },
+    agent: AGENT,
+    signal: SIGNAL,
+    retry,
+    sleep: recordedSleep(delays),
+  })
+
+  assert.equal(result.kind, COMPACTION_END.failed)
+  assert.equal(result.attempts, 2)
+  assert.equal(calls.length, 2)
+  assert.deepEqual(delays, [1000], 'the budget of the entry still decides the pauses')
+})
+
 test('a retry delay does not grow past the configured ceiling', async () => {
   const delays = []
 
@@ -145,54 +194,129 @@ test('a retry delay does not grow past the configured ceiling', async () => {
   assert.deepEqual(delays, [1000, 3000, 3000])
 })
 
+test('the default retry schedule waits 40, 60 and 90 seconds', async () => {
+  const delays = []
+  const retry = retryConfig()
+
+  // The documented defaults (design D3), read from the same config a run gets.
+  assert.deepEqual(
+    { attempts: retry.attempts, delayMs: retry.delayMs, factor: retry.factor, maxDelayMs: retry.maxDelayMs },
+    { attempts: 4, delayMs: 40_000, factor: 1.5, maxDelayMs: 0 },
+  )
+
+  const result = await compactBetweenTasks({
+    compactNow: scriptedCompact(
+      [failure('summary'), failure('summary'), failure('summary'), failure('summary')],
+      [],
+    ),
+    agent: AGENT,
+    signal: SIGNAL,
+    retry,
+    sleep: recordedSleep(delays),
+  })
+
+  assert.equal(result.kind, COMPACTION_END.failed)
+  assert.equal(result.attempts, 4)
+  // `maxDelayMs: 0` is no ceiling, so the growth follows the multiplier (D2).
+  assert.deepEqual(result.delays, [40_000, 60_000, 90_000])
+  assert.deepEqual(delays, [40_000, 60_000, 90_000])
+})
+
+test('a ceiling below the first delay does not shorten it', async () => {
+  const delays = []
+
+  const result = await compactBetweenTasks({
+    compactNow: scriptedCompact(
+      [failure('summary'), failure('summary'), failure('summary'), failure('summary')],
+      [],
+    ),
+    agent: AGENT,
+    signal: SIGNAL,
+    retry: retryConfig({ attempts: 4, delayMs: 40_000, factor: 1.5, maxDelayMs: 10_000 }),
+    sleep: recordedSleep(delays),
+  })
+
+  assert.equal(result.kind, COMPACTION_END.failed)
+  // The configured first delay wins over a lower ceiling: 40s, not 10s (D2).
+  assert.deepEqual(delays, [40_000, 40_000, 40_000])
+})
+
+test('a ceiling above the first delay caps the growth', async () => {
+  const delays = []
+
+  const result = await compactBetweenTasks({
+    compactNow: scriptedCompact(
+      [failure('summary'), failure('summary'), failure('summary'), failure('summary')],
+      [],
+    ),
+    agent: AGENT,
+    signal: SIGNAL,
+    retry: retryConfig({ attempts: 4, delayMs: 40_000, factor: 1.5, maxDelayMs: 50_000 }),
+    sleep: recordedSleep(delays),
+  })
+
+  assert.equal(result.kind, COMPACTION_END.failed)
+  // 40 000, then 60 000 capped to 50 000, then 90 000 capped to 50 000.
+  assert.deepEqual(delays, [40_000, 50_000, 50_000])
+})
+
 test('a changed code is terminal and is not retried', async () => {
   const calls = []
+  const sleeps = []
 
   const result = await compactBetweenTasks({
     compactNow: scriptedCompact([failure('changed'), null], calls),
     agent: AGENT,
     signal: SIGNAL,
     retry: retryConfig({ attempts: 3 }),
-    sleep: recordedSleep([]),
+    sleep: recordedSleep(sleeps),
   })
 
   assert.equal(result.kind, COMPACTION_END.failed)
   assert.equal(result.code, 'changed')
   assert.equal(result.attempts, 1)
   assert.deepEqual(result.delays, [])
+  assert.deepEqual(sleeps, [], 'a terminal code takes no pause')
   assert.equal(calls.length, 1)
 })
 
 test('a commit code is terminal and is not retried, even when its budget is left', async () => {
   const calls = []
+  const sleeps = []
 
   const result = await compactBetweenTasks({
     compactNow: scriptedCompact([failure('commit'), null], calls),
     agent: AGENT,
     signal: SIGNAL,
     retry: retryConfig({ attempts: 5 }),
-    sleep: recordedSleep([]),
+    sleep: recordedSleep(sleeps),
   })
 
   assert.equal(result.kind, COMPACTION_END.failed)
   assert.equal(result.code, 'commit')
   assert.equal(result.attempts, 1)
+  assert.deepEqual(result.delays, [])
+  assert.deepEqual(sleeps, [], 'a terminal code takes no pause')
   assert.equal(calls.length, 1)
 })
 
 test('a cancelled compaction is terminal even when the configuration lists it', async () => {
   const calls = []
+  const sleeps = []
 
   const result = await compactBetweenTasks({
     compactNow: scriptedCompact([failure('cancelled'), null], calls),
     agent: AGENT,
     signal: SIGNAL,
     retry: retryConfig({ attempts: 3, codes: ['summary', 'cancelled'] }),
-    sleep: recordedSleep([]),
+    sleep: recordedSleep(sleeps),
   })
 
   assert.equal(result.kind, COMPACTION_END.failed)
   assert.equal(result.code, 'cancelled')
+  assert.equal(result.attempts, 1)
+  assert.deepEqual(result.delays, [])
+  assert.deepEqual(sleeps, [], 'a terminal code takes no pause')
   assert.equal(calls.length, 1)
   assert.deepEqual(TERMINAL_CODES, ['changed', 'commit', 'cancelled'])
 })
@@ -273,6 +397,29 @@ test('a stop during the backoff ends the transition as cancelled, not as a failu
   assert.equal(result.attempts, 1)
   assert.deepEqual(delays, [1000])
   assert.equal(calls.length, 1, 'no attempt after the stop')
+})
+
+test('a real backoff ends as soon as the run is cancelled', async () => {
+  const controller = new AbortController()
+  const calls = []
+  const started = Date.now()
+
+  // No injected sleep here: the default `waitFor` is what a run actually uses, and
+  // the point is that a stop does not wait out the remaining forty seconds.
+  const pending = compactBetweenTasks({
+    compactNow: scriptedCompact([failure('summary'), null], calls),
+    agent: AGENT,
+    signal: controller.signal,
+    retry: retryConfig({ attempts: 3, delayMs: 40_000 }),
+  })
+  setTimeout(() => controller.abort(), 20)
+
+  const result = await pending
+
+  assert.equal(result.kind, COMPACTION_END.cancelled)
+  assert.equal(result.attempts, 1)
+  assert.equal(calls.length, 1)
+  assert.ok(Date.now() - started < 5000, 'the default wait ends on abort, not on the timer')
 })
 
 test('a stop during the backend call wins over the failure code', async () => {
