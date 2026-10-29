@@ -2175,6 +2175,65 @@ test('a transient compaction failure is retried under the configured policy', as
   assert.equal(messages.length, 2)
 })
 
+test('retry numbers are read per transition: a change reaches the next one, never mid-series', async () => {
+  // Design D5: the compactor is one per plugin, but the three volatile numbers are
+  // resolved on every transition. `live` stands in for the settings record a write
+  // changes and the config holds references to it, so nothing is rebuilt between the
+  // two transitions below — the control, the config object and the run stay the same.
+  const live = { attempts: 2, delayMs: 0, factor: 1 }
+  const base = resolveConfig()
+  const config = {
+    ...base,
+    compaction: {
+      ...base.compaction,
+      // The continue policy is what lets the failed transition reach the next one.
+      onFailure: { get: () => 'continue' },
+      retry: {
+        ...base.compaction.retry,
+        attempts: { get: () => live.attempts },
+        delayMs: { get: () => live.delayMs },
+        factor: { get: () => live.factor },
+      },
+    },
+  }
+  const flat = flatApply()
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(flat),
+    cliResult(tickedApplyIn(flat, [12])),
+    cliResult(tickedApplyIn(flat, [12, 13])),
+    cliResult(tickedApplyIn(flat, [12, 13])),
+  ])
+  // Each call records how many tasks had been sent when it happened: 1 for the
+  // transition after task 12, 2 for the transition after task 13. That is what tells
+  // the two series apart without relying on the order of the warnings alone.
+  const sent = []
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    config,
+    compactNow: async () => {
+      sent.push(messages.length)
+      // The budget is raised while the first series is still running: that series must
+      // keep the two calls it was promised (D5), while the next transition reads 3.
+      if (sent.length === 1) live.attempts = 3
+      throw Object.assign(new Error('manual compaction failed: busy'), { code: 'busy' })
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'error')
+  assert.equal(messages.length, 3, 'the continue policy sent every task')
+  assert.deepEqual(sent, [1, 1, 2, 2, 2], 'two calls for the first transition, three for the second')
+  assert.equal(cli.calls.length, 5, 'no extra reading: the report came from the last one')
+  // The counts in the report are the ones each transition entered with, so the raised
+  // setting never stretched the series already under way.
+  assert.match(
+    result.text,
+    /Warnings: compaction before task [\s\S]*failed after 2 attempts \(busy\): manual compaction failed: busy; compaction before task [\s\S]*failed after 3 attempts \(busy\): manual compaction failed: busy; the run continued without compaction\./,
+  )
+})
+
 test('a compaction that runs out of attempts stops the run and reports the code', async () => {
   const cli = scriptedCli([
     cliResult(fixture('repo.json')),
