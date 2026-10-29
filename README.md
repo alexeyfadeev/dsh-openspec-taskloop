@@ -148,7 +148,7 @@ had.
 ## Settings dsh
 
 **Settings dsh → OpenSpec Taskloop**, the page that sits right behind General and Models and edits this plugin's
-own configuration block. Seven rows:
+own configuration block. Ten rows:
 
 | What the page shows | Field | Default | What it turns on |
 | --- | --- | --- | --- |
@@ -158,6 +158,9 @@ own configuration block. Seven rows:
 | Pause after each task group | `pause.enabled` | off | End the run on the group boundary instead of handing the next group a session of its own: review and commit still run, then the report names the closed group and the task the next `/taskloop` continues from. |
 | Compact inside a task | `compaction.midTask` | off | Ask for compaction by context pressure on a step boundary, not only between tasks. |
 | When the compaction budget runs out | `compaction.onFailure` | Break | `Break` stops the run and reports the blocked task; `Continue` records a warning in the report and sends the next task anyway. |
+| Compaction attempts | `compaction.retry.attempts` | 4 | Calls to compaction on one transition between tasks, the first one included: four attempts are three waits, and a compaction that succeeds waits for none of them. |
+| First retry wait (seconds) | `compaction.retry.delayMs` | 40 | How long the run waits after the first failed compaction. The page asks for seconds and stores milliseconds. |
+| Retry wait multiplier | `compaction.retry.factor` | 1.5 | Every further wait is this many times the previous one; `1` waits the same every time. |
 | Protocol section | `protocol.systemSection` | off | Register the static protocol section on every agent the run drives. |
 
 There is no Save button: every row writes as soon as it is used, through the same config form the built-in pages
@@ -165,13 +168,20 @@ use, so the value lands in the profile's `cordis.patch.yml` and the next run app
 refused write puts the deployment's values back on screen and says so, instead of leaving a draft that never
 landed.
 
+The three retry numbers carry one computed line under them, with no field of its own: the waits a transition would
+make and their worst-case total, from the same rule the run applies afterward. Only those three numbers reach the
+page — `maxDelayMs` is profile-only — so the line assumes the default `maxDelayMs: 0`, no ceiling; a ceiling set in
+the profile can only shorten the waits, never lengthen them. With the defaults it reads
+`Waits between calls: 40с → 60с → 90с; worst case 3m10s.` The total covers the waits only, not the calls themselves.
+One attempt prints `No waits: this setting allows a single call, so nothing is retried.` instead. The line follows
+the stored values, so it moves when a write lands rather than while a number is still a draft.
+
 **Protocol section is meant to be switched on together with Compact inside a task.** The section exists to
 survive a summary taken mid-task: on its own it describes a run that is bounded only between tasks, which is
 already the case without it.
 
-The page is the plugin's only place for these seven values, and the three retry numbers sit on it for the same
-reason. The rest of the block below is a profile decision. And because the page is this plugin's own, there is no
-second, generated copy of it under Settings → Plugins.
+The page is the plugin's only place for these ten values; the rest of the block below is a profile decision. And
+because the page is this plugin's own, there is no second, generated copy of it under Settings → Plugins.
 
 ## Configuration
 
@@ -201,7 +211,7 @@ second, generated copy of it under Settings → Plugins.
       timeoutMs: 120000            # deadline of one openspec call
 ```
 
-The seven fields the page edits are volatile: they are read when they apply, so a change is picked up by the next
+The ten fields the page edits are volatile: they are read when they apply, so a change is picked up by the next
 run. `compaction.retry.attempts`, `delayMs` and `factor` are volatile too, and are read at the start of every
 transition between tasks rather than once when the plugin is created — another provider means another quota window,
 so these three numbers belong to the page. `compaction.retry.codes` and `compaction.retry.maxDelayMs` stay in the
