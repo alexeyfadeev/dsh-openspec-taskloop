@@ -1,4 +1,4 @@
-// dsh-openspec-taskloop — one `/taskloop` run, driven end to end (task 6.1).
+// dsh-openspec-taskloop — `/taskloop` runs, driven end to end (tasks 6.1, 5.1).
 //
 // Every module the command uses is the real one here, and the host is replaced at
 // exactly one boundary: the Cordis context. `createEnvironment()` resolves the
@@ -22,6 +22,11 @@
 // was sent, which is the whole of its answer, design D4), ask the user for the commit
 // message and start the commit tool. Everything the plugin decides is left to the
 // plugin.
+//
+// The second scenario is the retry budget the same compaction runs on (5.1): the
+// backend keeps failing with `summary`, the shipped schedule of 40, 60 and 90 seconds
+// is waited in full — through an injected clock, so the test does not pay for it —
+// and `break` withholds the second task of the open group instead of sending it.
 
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -473,4 +478,89 @@ test('two groups are reviewed, committed and handed over in the shipped modules'
   assert.ok(at(' The review of tasks 3.1 - 3.2') < at(' The commit of tasks 2.3 - 2.4'))
   assert.ok(at(' The commit of tasks 2.3 - 2.4') < at(' The commit of tasks 3.1 - 3.2'))
   assert.ok(at(' The commit of tasks 3.1 - 3.2') < at(' The run moved to session session-2'))
+})
+
+/**
+ * A clock that records the backoff instead of waiting for it.
+ *
+ * The pauses are the subject of the second scenario, and paying 40 + 60 + 90 seconds in
+ * wall-clock time would make the test take longer than the run it describes. The
+ * compactor takes its clock as a dependency; the control forwards this one in place of
+ * the real `waitFor`.
+ *
+ * @param {number[]} pauses - shared log of the delays, in milliseconds.
+ * @returns {(ms: number) => Promise<void>} the fake clock.
+ */
+const recordingSleep = (pauses) => async (ms) => {
+  pauses.push(ms)
+}
+
+test('four failed compactions wait the default schedule and break holds back the next task', async () => {
+  const events = []
+  const pauses = []
+  const project = createProject()
+  const subprocess = createSubprocess(project, events)
+
+  // The review and the commit are other changes' subjects and would only run at a
+  // group boundary, which this run must never reach: the first transition already
+  // spends the attempt budget of the compaction.
+  const config = resolveConfig({
+    commit: { enabled: false },
+    review: { enabled: false },
+    compaction: { onFailure: 'break' },
+  })
+  const services = {
+    subprocess,
+    workingDirectory: { get: () => CWD },
+    // The backend stays down: every call fails with the transient code whose window
+    // the default pauses exist to outlast.
+    compaction: {
+      async compactNow(agent) {
+        events.push(`compact ${agent.id}`)
+        throw Object.assign(new Error('manual compaction failed: summary'), { code: 'summary' })
+      },
+    },
+  }
+  const ctx = { get: (name) => services[name], logger: { warn() {} } }
+  const agent = {
+    id: 'agent-1',
+    session: { header: { cwd: CWD } },
+    followup(message) {
+      takeTurn(message.content[0].text, 'agent-1', project, events)
+    },
+    async whenIdle() {},
+  }
+  const control = createControl({
+    config,
+    ...createEnvironment(ctx, config),
+    sleep: recordingSleep(pauses),
+  })
+
+  const result = await control.run(
+    { commandId: 'command-1', agent, rawInput: '', attachments: [], signal: new AbortController().signal },
+    { change: null },
+  )
+
+  assert.equal(result.kind, 'error')
+
+  // The shipped defaults, travelled end to end: four calls, three pauses, and the
+  // growth of `factor` (1.5) with no ceiling (design D2, D3).
+  assert.deepEqual(pauses, [40_000, 60_000, 90_000])
+  assert.deepEqual(events, [
+    'task 2.3 in agent-1',
+    'compact agent-1',
+    'compact agent-1',
+    'compact agent-1',
+    'compact agent-1',
+  ])
+
+  // 2.4 continues the group and was withheld: `break` stops the run before it is sent,
+  // and the report names the four attempts the transition cost.
+  assert.match(
+    result.text,
+    /sent task 2\.3; compaction before task 2\.4 failed after 4 attempts \(summary\): manual compaction failed: summary; the run stopped and no further task was sent\./,
+  )
+  assert.doesNotMatch(result.text, /Warning:/)
+  // The turn of 2.3 is all that happened: no second task message was composed.
+  assert.equal(events.filter((event) => event.startsWith('task ')).length, 1)
 })
