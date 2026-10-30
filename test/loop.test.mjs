@@ -3,6 +3,11 @@
 // advances, or it is not and the run stops without sending anything else — the
 // stop that ends a run from outside, and the session handoff at a group boundary,
 // including the phase and the session id the loop publishes as the work moves.
+// The one exception to "unchecked ends the run" is pinned with the parking tests: a run
+// resumed after a pause re-sends the task whose turn that pause cancelled, once, and the
+// unchecked box of any other turn stops it as before (design D6 of the UI change). The same
+// tests pin the phase a pause may not cut short: a pause that lands while a finished group
+// is being reviewed and committed parks the run after that hook, not inside it (design D5).
 //
 // The agent is scripted rather than real: `whenIdle()` resolves on demand, so the
 // tests can pin that the plugin reads `tasks.md` only *after* the turn went quiet
@@ -257,6 +262,24 @@ function harness(responses, agentOverrides = {}) {
   }
 }
 
+/**
+ * Wait until a condition the loop is expected to reach holds.
+ *
+ * Used by the parking tests: the loop is entreated to reach a gate or a reading, and
+ * there is no event to subscribe to — the run slot only records that the state changed.
+ * Each attempt is one event-loop turn, so the loop's own awaits run in between.
+ *
+ * @param {() => boolean} predicate - condition to wait for.
+ * @returns {Promise<void>} resolves once the condition held at least once.
+ */
+async function until(predicate) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    if (predicate()) return
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  throw new Error('the condition did not hold within 500 event-loop turns')
+}
+
 test('a checked task advances the run to the next one, and the file is read after the turn', async () => {
   // 2.3 is ticked after its turn; 2.4 is sent next and stays unchecked.
   const { cli, messages, events, loop } = harness([
@@ -450,6 +473,311 @@ test('a read cut short by a stop ends the run as cancelled, not as a failure', a
   assert.equal(outcome.kind, LOOP_END.cancelled)
   assert.equal(calls.length, 1)
   assert.equal(messages.length, 0)
+})
+
+test('a pause during a turn parks the run before it reads the next task', async () => {
+  // The pause lands while 2.3's turn is still running. The first parking point is right
+  // after that turn went quiet (design D3 of the UI change), so the reading that follows
+  // belongs to the resumed run: a parked run must not spend a CLI call or a task on it.
+  const { run } = createRuns().start(CHANGE)
+  let pausedOnce = false
+  const { cli, messages, loop } = harness(
+    [
+      cliResult(fixture('ready.json')),
+      cliResult(progressedDocument()),
+      cliResult(progressedDocument()),
+    ],
+    {
+      async whenIdle() {
+        if (pausedOnce) return
+        pausedOnce = true
+        // Inside the turn: the loop is waiting for exactly this call to resolve.
+        run.pause()
+      },
+    },
+  )
+
+  const running = loop({
+    signal: run.signal,
+    waitWhilePaused: (signal) => run.waitWhilePaused(signal),
+  })
+
+  await until(() => cli.calls.length === 1 && messages.length === 1)
+  // Give the loop the turns it would need to read: the gate holds it before the read.
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(cli.calls.length, 1, 'a parked run reads nothing')
+  assert.equal(messages.length, 1, 'a parked run sends nothing')
+
+  run.resume()
+  const outcome = await running
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12, 13])
+  assert.equal(cli.calls.length, 3, 'the reading after the pause is the resumed run\'s first')
+  assert.equal(messages.length, 2)
+})
+
+test('a pause during a reading parks the run before the task leaves', async () => {
+  // The reading is in flight when the pause arrives. The second parking point is right
+  // before the message (design D3 of the UI change): the task the reading chose waits for
+  // the resume instead of being sent into a run the user asked to hold.
+  const { run } = createRuns().start(CHANGE)
+  const calls = []
+  const messages = []
+  let settleFirstRead
+  const cli = {
+    run(args) {
+      calls.push(args)
+      if (calls.length === 1) {
+        return new Promise((resolve) => {
+          settleFirstRead = () => resolve(cliResult(fixture('ready.json')))
+        })
+      }
+      return Promise.resolve(cliResult(fixture('ready.json')))
+    },
+  }
+  const agent = {
+    id: 'agent-1',
+    followup(message) {
+      messages.push(message)
+    },
+    async whenIdle() {},
+  }
+
+  const running = runLoop({
+    cli,
+    cwd: CWD,
+    change: CHANGE,
+    agent,
+    signal: run.signal,
+    waitWhilePaused: (signal) => run.waitWhilePaused(signal),
+  })
+
+  await until(() => calls.length === 1)
+  run.pause()
+  settleFirstRead()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(messages, [], 'the reading the pause interrupted sends nothing')
+
+  run.resume()
+  const outcome = await running
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.equal(messages.length, 1)
+  assert.equal(labelOf(messages[0]), '2.3', 'the resumed run sends the task it had selected')
+  assert.equal(calls.length, 2)
+})
+
+test('a resumed run re-sends the task its pause left unchecked', async () => {
+  // The pause lands inside 2.3's turn, so that turn ends with the box unticked. That is the
+  // user's cancellation rather than a failed task (design D6 of the UI change), and the
+  // resumed run sends 2.3 again. The allowance is spent by that check: the task after it
+  // (2.4) leaves its box unchecked and stops the run as it always did.
+  const { run } = createRuns().start(CHANGE)
+  let pausedOnce = false
+  const { cli, messages, loop } = harness(
+    [
+      cliResult(fixture('ready.json')),
+      cliResult(fixture('ready.json')),
+      cliResult(progressedDocument()),
+      cliResult(progressedDocument()),
+    ],
+    {
+      async whenIdle() {
+        if (pausedOnce) return
+        pausedOnce = true
+        // Inside the turn: the pause arrives while the loop is waiting for this turn.
+        run.pause()
+      },
+    },
+  )
+
+  const running = loop({
+    signal: run.signal,
+    waitWhilePaused: (signal) => run.waitWhilePaused(signal),
+    resumePending: () => run.takeResumePending(),
+  })
+
+  await until(() => run.paused)
+  run.resume()
+  const outcome = await running
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.equal(outcome.task.line, 13)
+  assert.deepEqual(messages.map(labelOf), ['2.3', '2.3', '2.4'], 'the cancelled task went out again')
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12, 12, 13])
+  assert.equal(cli.calls.length, 4)
+})
+
+test('the allowance a resume grants is spent by the first check', async () => {
+  // The task sent after the resume stays unchecked as well. The second check is an ordinary
+  // failure: the allowance belonged to the resumption and not to the task, so the run stops
+  // instead of sending 2.3 a third time (design D6 of the UI change).
+  const { run } = createRuns().start(CHANGE)
+  let pausedOnce = false
+  const { cli, messages, loop } = harness(
+    [
+      cliResult(fixture('ready.json')),
+      cliResult(fixture('ready.json')),
+      cliResult(fixture('ready.json')),
+    ],
+    {
+      async whenIdle() {
+        if (pausedOnce) return
+        pausedOnce = true
+        run.pause()
+      },
+    },
+  )
+
+  const running = loop({
+    signal: run.signal,
+    waitWhilePaused: (signal) => run.waitWhilePaused(signal),
+    resumePending: () => run.takeResumePending(),
+  })
+
+  await until(() => run.paused)
+  run.resume()
+  const outcome = await running
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.deepEqual(messages.map(labelOf), ['2.3', '2.3'])
+  assert.equal(cli.calls.length, 3)
+})
+
+test('a resume that released a pause taken before the message grants no allowance', async () => {
+  // This pause parked the run before 2.3 left, so no turn was cancelled. The resumed run's
+  // own turn leaves 2.3 unchecked, and that is the ordinary failure: the run stops instead of
+  // sending the task a second time (design D6 of the UI change).
+  const { run } = createRuns().start(CHANGE)
+  const calls = []
+  const messages = []
+  let settleFirstRead
+  const cli = {
+    run(args) {
+      calls.push(args)
+      if (calls.length === 1) {
+        return new Promise((resolve) => {
+          settleFirstRead = () => resolve(cliResult(fixture('ready.json')))
+        })
+      }
+      return Promise.resolve(cliResult(fixture('ready.json')))
+    },
+  }
+  const agent = {
+    id: 'agent-1',
+    followup(message) {
+      messages.push(message)
+    },
+    async whenIdle() {},
+  }
+
+  const running = runLoop({
+    cli,
+    cwd: CWD,
+    change: CHANGE,
+    agent,
+    signal: run.signal,
+    waitWhilePaused: (signal) => run.waitWhilePaused(signal),
+    resumePending: () => run.takeResumePending(),
+  })
+
+  await until(() => calls.length === 1)
+  run.pause()
+  settleFirstRead()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(messages, [], 'the reading the pause interrupted sends nothing')
+
+  run.resume()
+  const outcome = await running
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.equal(messages.length, 1, 'the resumed task went out once')
+  assert.equal(labelOf(messages[0]), '2.3')
+  assert.equal(calls.length, 2)
+})
+
+test('a pause during the review of a finished group parks the run only after the hook', async () => {
+  // 2.4's turn completes group 2, so the loop is inside the group hook when the pause
+  // arrives — the one phase whose turn a pause may not cancel (design D5 of the UI change).
+  // Reviewing and committing work that is already ticked off is allowed to run to its end,
+  // and the run then parks before the next task: 3.1 neither leaves nor opens its session.
+  const both = tickedDocument([12, 13])
+  const { cli, messages, events, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(progressedDocument()),
+    cliResult(both),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const { run } = createRuns().start(CHANGE, { sessionId: 'session-1' })
+  const phases = []
+  const opens = []
+  const prompts = []
+
+  const running = loop({
+    signal: run.signal,
+    waitWhilePaused: (signal) => run.waitWhilePaused(signal),
+    resumePending: () => run.takeResumePending(),
+    onPhase: (phase) => {
+      phases.push(phase)
+      run.setPhase(phase)
+    },
+    onGroupComplete: async (context) => {
+      // The pause lands while the group is being closed. The phase is what says a turn here
+      // may not be cut short, and the hook keeps going: the park waits for it to finish.
+      assert.equal(run.phase, RUN_PHASE.boundary, 'the group is closed in the boundary phase')
+      run.pause()
+      events.push(`review ${context.range.from}-${context.range.to}`)
+      await new Promise((resolve) => setImmediate(resolve))
+      events.push('commit')
+    },
+    openSession: async () => {
+      opens.push('session-2')
+      return {
+        sessionId: 'session-2',
+        followup(message) {
+          prompts.push(labelOf(message))
+          events.push(`prompt ${labelOf(message)}`)
+        },
+        async whenIdle() {},
+      }
+    },
+  })
+
+  // Parked with the hook behind it: the group is closed, and nothing of the next one has
+  // started — no message, no CLI call, no session.
+  await until(() => run.paused && phases.length === 2)
+  assert.deepEqual(phases, [RUN_PHASE.boundary, RUN_PHASE.task],
+    'the run leaves the boundary once the group is closed')
+  assert.deepEqual(events, [
+    'read',
+    'followup 2.3',
+    'idle',
+    'read',
+    'followup 2.4',
+    'idle',
+    'read',
+    'review 2.1-2.4',
+    'commit',
+  ])
+  assert.deepEqual(messages.map(labelOf), ['2.3', '2.4'], 'a parked run sends nothing')
+  assert.equal(cli.calls.length, 3, 'a parked run reads nothing')
+  assert.deepEqual(opens, [], 'the next group\'s session waits for the resume')
+
+  run.resume()
+  const outcome = await running
+
+  // The pause released no task whose turn it cancelled, so its allowance is spent at the
+  // gate: 3.1's own unchecked box ends the run as an ordinary failure instead of a re-send.
+  assert.deepEqual(messages.map(labelOf), ['2.3', '2.4'],
+    'the resumed task left in the new group\'s session, not the invocation\'s')
+  assert.deepEqual(prompts, ['3.1'], 'the next task went out once, after the resume')
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12, 13, 17])
+  assert.deepEqual(opens, ['session-2'])
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.equal(cli.calls.length, 4, 'the resumed run reads once and sends 3.1 once')
 })
 
 test('a new group continues in a session opened for it, and the run stays there', async () => {

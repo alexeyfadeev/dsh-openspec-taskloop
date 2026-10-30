@@ -13,6 +13,10 @@
 // of the gate are pinned here — a resume, and a stop, because a stop must end a parked
 // run instead of waiting for a resume nobody will send.
 //
+// A resume leaves one allowance behind (design D6 of the UI change): the task whose turn
+// the pause cancelled may be sent again, and `takeResumePending()` hands that allowance out
+// exactly once. What the loop does with it is covered in `test/loop.test.mjs`.
+//
 // Where the run is belongs to the handle as well (design D5/D7 of the UI change): the
 // phase the loop reports, and the session the work is in now. The loop is what discovers
 // both, so the handle only records them — and refusing a phase it does not know is the
@@ -187,6 +191,31 @@ test('a stop releases a parked run just as a resume does', async () => {
   assert.equal(run.signal.aborted, true)
   assert.equal(run.stopped, true)
   assert.equal(run.paused, false)
+})
+
+test('a resume grants one allowance to re-send the task it released', () => {
+  const { run } = createRuns().start('add-a')
+  assert.equal(run.takeResumePending(), false, 'a run that was never resumed has nothing to excuse')
+
+  run.pause()
+  assert.equal(run.takeResumePending(), false, 'parking alone grants nothing')
+
+  assert.equal(run.resume(), true)
+  assert.equal(run.takeResumePending(), true, 'the resume allows one re-send')
+  // Taking is what keeps the excuse from outliving its reading: the next check must see a
+  // plain failure, and only another resume may grant another allowance.
+  assert.equal(run.takeResumePending(), false)
+})
+
+test('a stop spends the allowance a resume left behind', () => {
+  const { run } = createRuns().start('add-a')
+  run.pause()
+  run.resume()
+  run.stop()
+
+  // The run is over, so nothing may take the allowance and read a cancelled run as one that
+  // may send again (design D6 of the UI change).
+  assert.equal(run.takeResumePending(), false)
 })
 
 test('an active run has nothing to resume, and a stopped run cannot be parked', () => {
