@@ -57,21 +57,37 @@ and its instruction names the whole task list instead of a task range. The **Cod
 setting turns the whole step off.
 
 A finished group is then committed — by the plugin, not by the model, through the tool in the **Commit tool**
-setting. `Git` stages the whole working tree (`git add -A`) and then runs `git commit -m`; `GitButler` runs
+setting. `Git` stages the working tree (`git add -A`) and then runs `git commit -m`; `GitButler` runs
 `but commit -b <branch> -m`, so that it commits into the branch chosen at the start of the run. GitButler
 0.22.0 or newer is required: the run reads `but --version` once, in the GitButler input card, and refuses to
 start if the installed CLI is below that floor or does not answer with a recognizable version. Before either, the run
 checks `git status --porcelain`, so a tree with no changes is not an error: nothing is committed and the report says
 there was nothing to commit, which is also the answer when you committed by hand first. The message is passed as one
 argv element rather than a command line, so quotes, spaces and line breaks inside it stay part of the message and can
-never add a command. Committing the tree whole means everything uncommitted goes in, including leftovers that are not
-this run's work — accepted deliberately, hence a report that says which group was committed rather than guessing what
-the run wrote. Each commit the run made is a sentence of the report, quoting the tool's own line because that line is
-where the commit id is, and the moment the tool commits the run also appends `commit <id>` to the transcript of the
-session the group ran in — so the id is readable before the next group starts, rather than only in the report at the
-end. A commit the tool refuses stops the run: the group is already ticked off in `tasks.md`, so the report names the
-tool, its exit code and the reason it gave, and no further task is sent. The next `/taskloop` continues with the next
-task; the commit itself can be redone by hand with the same message — your text plus the range of the group.
+never add a command. Committing the tree whole — the default — means everything uncommitted goes in, including
+leftovers that are not this run's work — accepted deliberately, hence a report that says which group was committed
+rather than guessing what the run wrote. Each commit the run made is a sentence of the report, quoting the tool's own
+line because that line is where the commit id is, and the moment the tool commits the run also appends `commit <id>` to
+the transcript of the session the group ran in — so the id is readable before the next group starts, rather than only
+in the report at the end. A commit the tool refuses stops the run: the group is already ticked off in `tasks.md`, so
+the report names the tool, its exit code and the reason it gave, and no further task is sent. The next `/taskloop`
+continues with the next task; the commit itself can be redone by hand with the same message — your text plus the range
+of the group.
+
+With **Commit openspec files** off, the commit stops at the edge of `openspec/`. `git` gets the same pathspec in both
+requests — `git add -A -- . ':(exclude)openspec'` stages, and `git commit -m <msg> -- . ':(exclude)openspec'` commits —
+so nothing under that directory enters the index the commit takes, not even a change you had staged there yourself.
+`but commit` has no flag to exclude a path, so GitButler is told the same thing the other way round: the files
+outside `openspec/`, exactly as the status check read them, are named after the message
+(`but commit -b <branch> -m <msg> <file>…`), and those are what the tool commits. The ticks in `tasks.md`, the spec and
+design edits and every other change under `openspec/` therefore stay uncommitted in the working tree, and the report
+counts them, so a run does not pile them up in silence. Keeping the two histories apart is the point of the setting: a
+commit of the code no longer carries the record that the work was done, and reverting it does not undo the ticks of the
+tasks it completed. Nothing commits those leftovers while the setting stays off — they are yours, in one go or in
+commits of their own; switching the setting back on hands them to the next group commit. A group that changed nothing
+outside `openspec/` is not an error: its commit is skipped exactly as it is for an empty tree, and the report says
+there was nothing to commit outside `openspec/`. Past 200 paths named for GitButler the command line is at risk, so the
+list is dropped and the commit takes the whole tree, `openspec/` included.
 
 With **GitButler** the run also needs to know the branch those commits go into. `but commit` refuses to guess when the
 project has more than one applied branch, and refuses outright when it is started without a terminal, so the branch
