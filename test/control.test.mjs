@@ -212,6 +212,8 @@ function recordingPrompt() {
  * @param {Function} [options.compactIfNeeded] - one step-boundary compaction call (6.3).
  * @param {Function} [options.setApproval] - approval narrowing of a review session (3.3).
  * @param {Function} [options.runCommitCommand] - runner of the commit tool (4.2/4.3).
+ * @param {Function} [options.normalizeEol] - the rewrite of the committed files' endings
+ *   to LF that a GitButler commit performs (5.4, design D8).
  * @param {Function} [options.commitInput] - the input of this change's commits: the message
  *   text and, for GitButler, the branch (5.2, 7.3).
  * @param {Function} [options.forgetCommitText] - dropping the stored text of a finished change (5.3).
@@ -231,6 +233,7 @@ function harness({
   compactIfNeeded,
   setApproval,
   runCommitCommand,
+  normalizeEol,
   commitInput,
   forgetCommitText,
   appendNotice,
@@ -273,6 +276,7 @@ function harness({
       await setApproval?.(sessionId)
     },
     runCommitCommand,
+    normalizeEol,
     commitInput,
     appendNotice,
     forgetCommitText: async (context) => {
@@ -1069,6 +1073,214 @@ test('an empty working tree is not committed and the report says there was nothi
   )
 })
 
+test('with the setting off, a tree that changed only under openspec/ is skipped and says what stayed', async () => {
+  // The gate filters before it counts (D2), so this tree has nothing to commit — but it
+  // is not the empty tree above, and the report has to say which one it met: a user who
+  // turned the setting off needs to know the work is sitting in `openspec/` rather than
+  // missing (D5). The skip is still the same outcome, so the run ends as it always did.
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(twoTaskFlat([])),
+    cliResult(twoTaskFlat([12])),
+    cliResult(twoTaskFlat([12, 13])),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk(' M openspec/changes/c/tasks.md\0?? openspec/specs/new.md\0'),
+  })
+  const { control, agent } = harness({
+    createCli: () => cli,
+    config: { commit: { openspec: false } },
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    runCommitCommand: tool.run,
+    openSession: async () => ({ sessionId: 'review-1', followup() {}, async whenIdle() {} }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  // Nothing outside `openspec/` means the tool is never asked to commit anything.
+  assert.deepEqual(tool.calls.map((call) => call.name), ['git status'])
+  assert.match(
+    result.text,
+    /The commit of the whole task list was skipped: the working tree had no uncommitted changes outside openspec\/\./u,
+  )
+})
+
+test('with the setting off, a commit that went through says how many openspec/ changes it left', async () => {
+  // The count is the only trace of what the boundary kept out of the history (D5): the
+  // commit went through and the group is closed, so a tree that still holds `openspec/`
+  // changes would otherwise read exactly like a clean one. Both numbers are checked
+  // because the sentence is the only place the report says "1" or "2", and a count that
+  // is reported wrongly is worse than one that is not reported.
+  for (const [dropped, phrase] of [[1, '1 change'], [2, '2 changes']]) {
+    const cli = scriptedCli([
+      cliResult(fixture('repo.json')),
+      cliResult(twoTaskFlat([])),
+      cliResult(twoTaskFlat([12])),
+      cliResult(twoTaskFlat([12, 13])),
+    ])
+    const status = [' M lib/control.js', ' M openspec/changes/c/tasks.md', '?? openspec/specs/new.md']
+    const tool = scriptedCommitTool({
+      'git status': toolOk(`${status.slice(0, dropped + 1).join('\0')}\0`),
+      'git add': toolOk(),
+      'git commit': toolOk('[main 1a2b3c4] Добавить эндпоинт\n'),
+    })
+    const { control, agent } = harness({
+      createCli: () => cli,
+      config: { commit: { openspec: false } },
+      commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+      runCommitCommand: tool.run,
+      openSession: async () => ({ sessionId: 'review-1', followup() {}, async whenIdle() {} }),
+    })
+
+    const result = await control.run(invocation(agent), { change: null })
+
+    assert.equal(result.kind, 'success')
+    // One file outside `openspec/` was committed, the rest stayed in the tree.
+    assert.deepEqual(
+      tool.calls.map((call) => call.name),
+      ['git status', 'git add', 'git commit'],
+    )
+    assert.match(
+      result.text,
+      /The commit of the whole task list through git went through: \[main 1a2b3c4\] Добавить эндпоинт\./u,
+    )
+    assert.match(
+      result.text,
+      new RegExp(`The commit left ${phrase} under openspec/ uncommitted in the working tree\\.`, 'u'),
+    )
+  }
+})
+
+test('with the setting on, a commit that went through carries no sentence about what it left', async () => {
+  // The setting on is the default and the whole tree is the change set, `openspec/`
+  // included: nothing was dropped, the outcome has no count, and the sentence must read
+  // exactly as it did before this setting existed — a run that never touched it must not
+  // even hint at the boundary (D5).
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(twoTaskFlat([])),
+    cliResult(twoTaskFlat([12])),
+    cliResult(twoTaskFlat([12, 13])),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk(' M openspec/changes/c/tasks.md\0?? openspec/specs/new.md\0'),
+    'git add': toolOk(),
+    'git commit': toolOk('[main 1a2b3c4] Добавить эндпоинт\n'),
+  })
+  const { control, agent } = harness({
+    createCli: () => cli,
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    runCommitCommand: tool.run,
+    openSession: async () => ({ sessionId: 'review-1', followup() {}, async whenIdle() {} }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  assert.match(
+    result.text,
+    /The commit of the whole task list through git went through: \[main 1a2b3c4\] Добавить эндпоинт\./u,
+  )
+  assert.doesNotMatch(result.text, /The commit left/u)
+})
+
+test('with the setting off, a group whose work stayed in openspec/ still pauses after its boundary', async () => {
+  // The empty outcome is the same outcome it has always been (D5): a tree with nothing
+  // to commit outside `openspec/` is a skip, not a failing commit. The boundary still
+  // runs — the review of the finished group comes first — and the pause is its last step
+  // (design D21), exactly as it is after a commit that went through. A run must not read
+  // as broken because the work it just finished happened to land where the setting keeps
+  // it out of the history.
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk(' M openspec/changes/c/tasks.md\0?? openspec/specs/new.md\0'),
+  })
+  const opened = []
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    config: { commit: { openspec: false }, pause: { enabled: true } },
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    runCommitCommand: tool.run,
+    openSession: async (invocation, context) => {
+      const sessionId = context.range === undefined ? 'session-2' : 'review-1'
+      opened.push(sessionId)
+      return { sessionId, followup() {}, async whenIdle() {} }
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  // The gate ran, found nothing outside `openspec/`, and nothing was staged or committed.
+  assert.deepEqual(tool.calls.map((call) => call.name), ['git status'])
+  // The review happened at the boundary; the session of group 3 was never opened.
+  assert.deepEqual(opened, ['review-1'])
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /The review of tasks 2\.1 - 2\.4 ran in session review-1\./u)
+  assert.match(
+    result.text,
+    /The commit of tasks 2\.1 - 2\.4 was skipped: the working tree had no uncommitted changes outside openspec\/\./u,
+  )
+  assert.match(
+    result.text,
+    /The run paused after tasks 2\.1 - 2\.4: no further task was sent, and \/taskloop continues with task 3\.1\./u,
+  )
+  // No commit failed: the skip is a sentence of the boundary, and the pause is the only
+  // thing that ended the run.
+  assert.doesNotMatch(result.text, /the commit of tasks 2\.1 - 2\.4 through git failed/u)
+  assert.doesNotMatch(result.text, /The run moved to/u)
+  assert.match(control.status().text, /no run is active/u)
+  assert.equal(messages.length, 2)
+  assert.equal(cli.calls.length, 4, 'no reading followed the pause')
+})
+
+test('with the setting off, an empty filtered tree does not end the run before the next group', async () => {
+  // Without the pause the loop goes on to group 3, exactly as it does after any other
+  // skip (D5): the empty tree is a sentence of the report, never a result of the run.
+  // The session that takes over is the same one a commit that went through would open.
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk(' M openspec/changes/c/tasks.md\0'),
+  })
+  const opened = []
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    config: { review: { enabled: false }, commit: { openspec: false } },
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    runCommitCommand: tool.run,
+    openSession: async (invocation, context) => {
+      opened.push(context)
+      return { sessionId: 'session-2', followup() {}, async whenIdle() {} }
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.deepEqual(tool.calls.map((call) => call.name), ['git status'])
+  // The group was closed and the next one opened in a session of its own.
+  assert.equal(opened.length, 1)
+  assert.equal(opened[0].task.line, 17)
+  assert.match(result.text, /The run moved to session session-2 \(task 3\.1\) at the group boundary\./u)
+  assert.match(
+    result.text,
+    /The commit of tasks 2\.1 - 2\.4 was skipped: the working tree had no uncommitted changes outside openspec\/\./u,
+  )
+  assert.equal(messages.length, 2)
+})
+
 test('a run without a commit message text does not commit and says why', async () => {
   // A deployment with no source for the text — nothing stored and nobody to ask — is the
   // `unavailable` case of the seam (5.2). The group must not read as committed, so the
@@ -1195,6 +1407,54 @@ test('the commit tool is read at the moment of the commit, so a switch applies t
   assert.match(
     result.text,
     /The commit of the whole task list through gitbutler without naming a branch went through: Committed as 1a2b3c4\./u,
+  )
+})
+
+test('the openspec setting is read at the moment of the commit, so a switch applies to the next group', async () => {
+  // `commit.openspec` is volatile for the same reason as the tool (D1, D12): a run that
+  // started with the whole tree in scope commits with the pathspec exclusion when the
+  // setting was turned off after its first turn. A snapshot taken at the start of the run
+  // would still stage `openspec/` with a bare `git add -A`.
+  const base = resolveConfig({})
+  const live = { openspec: true }
+  const config = {
+    ...base,
+    commit: { ...base.commit, openspec: { get: () => live.openspec } },
+  }
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(twoTaskFlat([])),
+    cliResult(twoTaskFlat([12])),
+    cliResult(twoTaskFlat([12, 13])),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk(' M lib/commit.js\n'),
+    'git add': toolOk(),
+    'git commit': toolOk('[main 1a2b3c4] Добавить эндпоинт\n'),
+  })
+  const { control, agent } = harness({
+    createCli: () => cli,
+    config,
+    commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
+    runCommitCommand: tool.run,
+    openSession: async () => ({ sessionId: 'review-1', followup() {}, async whenIdle() {} }),
+    agent: {
+      async whenIdle() {
+        live.openspec = false
+      },
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  // The exclusion reached both requests of the commit, which is the only way `git`
+  // keeps a staged `openspec/` file out of the commit (D3).
+  assert.deepEqual(tool.calls.map((call) => call.name), ['git status', 'git add', 'git commit'])
+  assert.deepEqual(tool.calls[1].request.args, ['add', '-A', '--', '.', ':(exclude)openspec'])
+  assert.deepEqual(
+    tool.calls[2].request.args,
+    ['commit', '-m', 'Добавить эндпоинт', '--', '.', ':(exclude)openspec'],
   )
 })
 
@@ -1327,6 +1587,176 @@ test('an empty tree creates no branch and commits nothing', async () => {
   assert.deepEqual(tool.calls.map((call) => call.name), ['git status'])
   assert.equal(plan.exists, false, 'no branch may be left behind with no commit in it')
   assert.match(result.text, /The commit of tasks 2\.1 - 2\.4 was skipped: the working tree had no uncommitted changes\./u)
+})
+
+test('a commit that cannot heal the endings of a file says which file stays modified', async () => {
+  // The step before `but commit` normalises only the lines this group changed (D8), so a
+  // file whose blob already mixes the two endings stays modified however often it is
+  // committed. The report is the only place the user learns that, and it names the file:
+  // a count would send them looking for which one.
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk(' M lib/control.js\0 M test/control.test.mjs\0'),
+    'but commit': toolOk('Committed as 1a2b3c4\n'),
+  })
+  const rewrites = []
+  const { control, agent } = harness({
+    createCli: () => cli,
+    config: { commit: { tool: 'gitbutler' } },
+    commitInput: async () => ({
+      kind: COMMIT_TEXT.text,
+      text: 'Добавить эндпоинт',
+      branch: createButBranch({ name: 'feature-a', exists: true }),
+    }),
+    runCommitCommand: tool.run,
+    normalizeEol: async (files, options) => {
+      rewrites.push({ files, cwd: options.cwd })
+      return { rewritten: files, mixed: ['lib/control.js'] }
+    },
+    openSession: async (invocation, context) => ({
+      sessionId: context.range === undefined ? 'session-2' : 'review-1',
+      followup() {},
+      async whenIdle() {},
+    }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  // The setting is on, so the whole change set is what the commit composes the tree from.
+  assert.deepEqual(rewrites, [{ files: ['lib/control.js', 'test/control.test.mjs'], cwd: CWD }])
+  // The rewrite opens no request of its own: the injected one stands for the file system.
+  assert.deepEqual(tool.calls.map((call) => call.name), ['git status', 'but commit'])
+  assert.match(
+    result.text,
+    /went through: Committed as 1a2b3c4\. The file lib\/control\.js keeps a mixed history of CRLF and LF: this commit normalised only the lines it changed, so git status will keep reporting it as modified\./u,
+  )
+})
+
+test('every file a commit could not heal is named in the warning', async () => {
+  // One sentence for the files of one commit, not one sentence each: they are the same
+  // fact about the same step, and a run that left two files dirty must name both.
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk(' M lib/control.js\0 M lib/eol.js\0'),
+    'but commit': toolOk('Committed as 1a2b3c4\n'),
+  })
+  const { control, agent } = harness({
+    createCli: () => cli,
+    config: { commit: { tool: 'gitbutler' } },
+    commitInput: async () => ({
+      kind: COMMIT_TEXT.text,
+      text: 'Добавить эндпоинт',
+      branch: createButBranch({ name: 'feature-a', exists: true }),
+    }),
+    runCommitCommand: tool.run,
+    normalizeEol: async (files) => ({ rewritten: files, mixed: ['lib/control.js', 'lib/eol.js'] }),
+    openSession: async (invocation, context) => ({
+      sessionId: context.range === undefined ? 'session-2' : 'review-1',
+      followup() {},
+      async whenIdle() {},
+    }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.match(
+    result.text,
+    /The files lib\/control\.js and lib\/eol\.js keep a mixed history of CRLF and LF: this commit normalised only the lines it changed, so git status will keep reporting them as modified\./u,
+  )
+})
+
+test('a commit that healed every file it normalised carries no warning', async () => {
+  // The rewrite of the endings is silent when it worked: every file it touched came out
+  // consistent, and a report that warned here would make the ordinary commit sound broken.
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({
+    'git status': toolOk(' M lib/control.js\0'),
+    'but commit': toolOk('Committed as 1a2b3c4\n'),
+  })
+  let rewrote = false
+  const { control, agent } = harness({
+    createCli: () => cli,
+    config: { commit: { tool: 'gitbutler' } },
+    commitInput: async () => ({
+      kind: COMMIT_TEXT.text,
+      text: 'Добавить эндпоинт',
+      branch: createButBranch({ name: 'feature-a', exists: true }),
+    }),
+    runCommitCommand: tool.run,
+    normalizeEol: async (files) => {
+      rewrote = true
+      return { rewritten: files, mixed: [] }
+    },
+    openSession: async (invocation, context) => ({
+      sessionId: context.range === undefined ? 'session-2' : 'review-1',
+      followup() {},
+      async whenIdle() {},
+    }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(rewrote, true, 'the step ran, and the report stayed silent about it')
+  assert.match(result.text, /went through: Committed as 1a2b3c4\./u)
+  assert.doesNotMatch(result.text, /mixed history/u)
+})
+
+test('a commit that never happened says nothing about a history it did not touch', async () => {
+  // The warning belongs to a commit that went through (D8): an empty tree normalises
+  // nothing, so there is no file whose endings this run could have left half-repaired.
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const tool = scriptedCommitTool({ 'git status': toolOk('') })
+  const { control, agent } = harness({
+    createCli: () => cli,
+    config: { commit: { tool: 'gitbutler' } },
+    commitInput: async () => ({
+      kind: COMMIT_TEXT.text,
+      text: 'Добавить эндпоинт',
+      branch: createButBranch({ name: 'feature-a', exists: true }),
+    }),
+    runCommitCommand: tool.run,
+    normalizeEol: async () => {
+      throw new Error('an empty tree must not reach the rewrite of the endings')
+    },
+    openSession: async (invocation, context) => ({
+      sessionId: context.range === undefined ? 'session-2' : 'review-1',
+      followup() {},
+      async whenIdle() {},
+    }),
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.match(result.text, /was skipped: the working tree had no uncommitted changes\./u)
+  assert.doesNotMatch(result.text, /mixed history/u)
 })
 
 test('a cancelled branch question starts no run and says which question it was', async () => {
