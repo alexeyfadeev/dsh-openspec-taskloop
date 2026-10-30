@@ -753,7 +753,7 @@ test('a clean tree ends the commit before any command that changes it', async ()
   })
 
   assert.equal(outcome.kind, COMMIT_END.empty)
-  assert.deepEqual(subprocess.calls.spawn.map((spec) => spec.argv.slice(1)), [['status', '--porcelain']])
+  assert.deepEqual(subprocess.calls.spawn.map((spec) => spec.argv.slice(1)), [['status', '--porcelain', '-z', '-uall']])
 })
 
 test('a stop terminates the tool and ends the commit as stopped, not as a refusal', async () => {

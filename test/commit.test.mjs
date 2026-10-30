@@ -26,6 +26,9 @@ import {
   buildCommitMessage,
   commitIdOf,
   createButBranch,
+  filterOpenspec,
+  isOpenspecPath,
+  parseStatus,
   runCommit,
 } from '../lib/commit.js'
 import { COMMIT_TOOLS } from '../lib/config.js'
@@ -162,9 +165,115 @@ test('the message reaches the tool as one argument, whatever it contains', () =>
   assert.equal(commit.args.length, 3)
 })
 
+// --- the status check (task 2.1, design D2) --------------------------------
+
+test('the status parser reads the NUL-separated records of `-z`', () => {
+  // `-z` prints each path literally: the space in the last one is part of the name,
+  // not a quoting artefact, and the entry does not end with a newline.
+  assert.deepEqual(parseStatus(' M lib/control.js\0?? lib/commit.js\0A  docs/a b.md\0'), [
+    { status: ' M', path: 'lib/control.js' },
+    { status: '??', path: 'lib/commit.js' },
+    { status: 'A ', path: 'docs/a b.md' },
+  ])
+})
+
+test('a rename or a copy keeps its original path inside the same record', () => {
+  // `R`/`C` occupy two fields — the new path and the path it came from. The second
+  // field is not a change of its own, or the old path would be committed again.
+  assert.deepEqual(parseStatus('R  lib/new.js\0lib/old.js\0 M lib/other.js\0'), [
+    { status: 'R ', path: 'lib/new.js', from: 'lib/old.js' },
+    { status: ' M', path: 'lib/other.js' },
+  ])
+  assert.deepEqual(parseStatus('C  lib/copy.js\0lib/source.js\0'), [
+    { status: 'C ', path: 'lib/copy.js', from: 'lib/source.js' },
+  ])
+})
+
+test('an empty status answer is an empty list of changes', () => {
+  assert.deepEqual(parseStatus(''), [])
+  // The NUL that terminates the last entry leaves one empty field behind.
+  assert.deepEqual(parseStatus('\0'), [])
+  // A provider that appended a newline said nothing either.
+  assert.deepEqual(parseStatus('\n\n'), [])
+  assert.deepEqual(parseStatus(undefined), [])
+})
+
+test('the last record is read even when the answer ends without a NUL', () => {
+  assert.deepEqual(parseStatus(' M a.js\0?? b.js'), [
+    { status: ' M', path: 'a.js' },
+    { status: '??', path: 'b.js' },
+  ])
+  // One record and no terminator at all is still one change.
+  assert.deepEqual(parseStatus('?? b.js'), [{ status: '??', path: 'b.js' }])
+})
+
+// --- the openspec boundary (task 2.2, design D2) ---------------------------
+
+test('a path under the project openspec directory is excluded', () => {
+  assert.equal(isOpenspecPath('openspec/x'), true)
+  assert.equal(isOpenspecPath('openspec/changes/c/tasks.md'), true)
+  // A directory path is under it too: the predicate is about paths, whatever shape the
+  // parser happened to keep.
+  assert.equal(isOpenspecPath('openspec/'), true)
+})
+
+test('a path that only starts with the same letters is not excluded', () => {
+  // The first segment is the rule, not a prefix of the string: all of these live
+  // outside the project's `openspec/` and must reach the commit.
+  assert.equal(isOpenspecPath('openspec-foo/x'), false)
+  assert.equal(isOpenspecPath('src/openspec/x'), false)
+  // A file named `openspec` is not the directory, however the name starts.
+  assert.equal(isOpenspecPath('openspec'), false)
+  assert.equal(isOpenspecPath('openspec.md'), false)
+  // A path is what git printed; anything else names nothing.
+  assert.equal(isOpenspecPath(undefined), false)
+})
+
+test('the filter keeps the changes outside openspec and hands the rest back', () => {
+  const { changes, excluded } = filterOpenspec(parseStatus(
+    ' M lib/control.js\0?? openspec/changes/c/tasks.md\0A  openspec-foo/x\0?? openspec\0',
+  ))
+  // Order is preserved on both sides, and a change that only looks like the directory
+  // stays with the commit.
+  assert.deepEqual(changes.map((change) => change.path), [
+    'lib/control.js',
+    'openspec-foo/x',
+    'openspec',
+  ])
+  assert.deepEqual(excluded.map((change) => change.path), ['openspec/changes/c/tasks.md'])
+})
+
+test('a tree without changes is empty on both sides of the filter', () => {
+  assert.deepEqual(filterOpenspec(parseStatus('')), { changes: [], excluded: [] })
+})
+
+// --- untracked directories (task 2.3, design D2) ---------------------------
+
+test('the status check asks git to expand an untracked directory into its files', () => {
+  // `-uall` is what keeps `?? dir/` out of the answer: the commit names files, and a
+  // directory is an argument neither tool resolves (D2, D4).
+  assert.deepEqual(STATUS_COMMAND.args, ['status', '--porcelain', '-z', '-uall'])
+})
+
+test('a directory entry is not a path the commit names', () => {
+  // Should a directory entry reach the parser anyway, it must not become a change: the
+  // files it holds are what a commit carries, and `-uall` prints exactly those.
+  const changes = parseStatus('?? dir/\0?? dir/a.js\0?? dir/sub/b.js\0')
+  assert.deepEqual(changes.map((change) => change.path), ['dir/a.js', 'dir/sub/b.js'])
+  assert.equal(changes.every((change) => !change.path.endsWith('/')), true)
+})
+
+test('a rename of a directory keeps its pairing even though the entry is dropped', () => {
+  // The original path of a `R`/`C` entry is read before the directory test, so dropping
+  // the entry cannot make the path it came from look like a change of its own.
+  assert.deepEqual(parseStatus('R  dir/\0dir-old\0 M lib/a.js\0'), [
+    { status: ' M', path: 'lib/a.js' },
+  ])
+})
+
 test('a commit through git checks the tree, stages it and commits it', async () => {
   const { run, calls } = fakeRunner({
-    'git status': ok(' M lib/control.js\n?? lib/commit.js\n'),
+    'git status': ok(' M lib/control.js\0?? lib/commit.js\0'),
     'git add': ok(),
     'git commit': ok('[main 1a2b3c4] Добавить эндпоинт. Tasks 2.1 - 2.4\n 2 files changed, 40 insertions(+)\n'),
   })
@@ -185,7 +294,7 @@ test('a commit through git checks the tree, stages it and commits it', async () 
 
 test('GitButler runs its own commit request and reports what it printed', async () => {
   const { run, calls } = fakeRunner({
-    'git status': ok('M lib/commit.js\n'),
+    'git status': ok('M lib/commit.js\0'),
     'but commit': ok('Committed as 1a2b3c4\n'),
   })
 
@@ -230,7 +339,7 @@ test('a status check that fails stops the commit before anything is staged', asy
 
 test('a staging that fails is reported with its code and its stderr', async () => {
   const { run, calls } = fakeRunner({
-    'git status': ok(' M lib/control.js\n'),
+    'git status': ok(' M lib/control.js\0'),
     'git add': no(128, { stderr: 'fatal: pathspec is outside the repository\n' }),
   })
 
@@ -246,7 +355,7 @@ test('a staging that fails is reported with its code and its stderr', async () =
 
 test('a commit the tool refused carries its code and the reason it gave', async () => {
   const { run } = fakeRunner({
-    'git status': ok(' M lib/control.js\n'),
+    'git status': ok(' M lib/control.js\0'),
     'git add': ok(),
     'git commit': no(1, { stderr: 'Author identity unknown\n\n*** Please tell me who you are.\n' }),
   })
@@ -263,7 +372,7 @@ test('a commit the tool refused carries its code and the reason it gave', async 
 
 test('a failure that printed only to stdout still explains itself', async () => {
   const { run } = fakeRunner({
-    'git status': ok(' M lib/commit.js\n'),
+    'git status': ok(' M lib/commit.js\0'),
     'git add': ok(),
     'git commit': no(1, { stdout: 'error: nothing to commit\n' }),
   })
@@ -275,7 +384,7 @@ test('a failure that printed only to stdout still explains itself', async () => 
 
 test('a silent refusal still says which code it exited with', async () => {
   const { run } = fakeRunner({
-    'git status': ok(' M lib/commit.js\n'),
+    'git status': ok(' M lib/commit.js\0'),
     'git add': ok(),
     'git commit': no(2),
   })
@@ -289,7 +398,7 @@ test('a silent refusal still says which code it exited with', async () => {
 test('a reason keeps the tail of a long stderr', async () => {
   const stderr = `${'hint: a lot of explaining\n'.repeat(500)}fatal: the last word\n`
   const { run } = fakeRunner({
-    'git status': ok(' M lib/commit.js\n'),
+    'git status': ok(' M lib/commit.js\0'),
     'git add': ok(),
     'git commit': no(1, { stderr }),
   })
@@ -303,7 +412,7 @@ test('a reason keeps the tail of a long stderr', async () => {
 test('a tool that cannot run is a failure of the commit, not a crash', async () => {
   const spawn = new Error('git CLI is not available: spawn git ENOENT')
   const { run } = fakeRunner({
-    'git status': ok(' M lib/commit.js\n'),
+    'git status': ok(' M lib/commit.js\0'),
     'git add': ok(),
     'git commit': spawn,
   })
@@ -333,7 +442,7 @@ test('a run stopped before the commit performs no request', async () => {
 test('a stop while the tree is being staged does not commit it', async () => {
   const controller = new AbortController()
   const { run, calls } = fakeRunner({
-    'git status': ok(' M lib/control.js\n'),
+    'git status': ok(' M lib/control.js\0'),
     'git add': () => {
       controller.abort()
       return ok()
@@ -367,7 +476,7 @@ test('a stop during the status check is a stop, not a failed tool', async () => 
 test('a commit that went through stays committed when the stop lands while it finishes', async () => {
   const controller = new AbortController()
   const { run } = fakeRunner({
-    'git status': ok(' M lib/control.js\n'),
+    'git status': ok(' M lib/control.js\0'),
     'git add': ok(),
     'git commit': () => {
       controller.abort()
@@ -401,7 +510,7 @@ test('a message that cannot be built is refused before the tree is touched', asy
 
 test('the tool is part of every outcome, so a report can name it', async () => {
   const { run } = fakeRunner({
-    'git status': ok('M lib/commit.js\n'),
+    'git status': ok('M lib/commit.js\0'),
     'but commit': no(1, { stderr: 'no branch assigned\n' }),
   })
 
@@ -479,7 +588,7 @@ test('the plan reads its branch name and anchor, and exists only when it says so
 test('a new branch is created on the first commit and not on the next one', async () => {
   const branch = createButBranch({ name: 'feature-b', anchor: 'feature-a' })
   const { run, calls } = fakeRunner({
-    'git status': ok('M lib/commit.js\n'),
+    'git status': ok('M lib/commit.js\0'),
     'but branch': ok('Created branch feature-b\n'),
     'but commit': ok('Committed as 1a2b3c4\n'),
   })
@@ -521,7 +630,7 @@ test('an empty tree creates no branch and leaves the plan for the next group', a
 test('a branch creation that failed stops the commit before anything is committed', async () => {
   const branch = createButBranch({ name: 'feature-b', anchor: 'feature-a' })
   const { run, calls } = fakeRunner({
-    'git status': ok('M lib/commit.js\n'),
+    'git status': ok('M lib/commit.js\0'),
     'but branch': no(1, { stderr: 'branch feature-b already exists\n' }),
   })
 
@@ -542,7 +651,7 @@ test('a stop while the branch is being created commits nothing and keeps the pla
   const controller = new AbortController()
   const branch = createButBranch({ name: 'feature-b', anchor: 'feature-a' })
   const { run, calls } = fakeRunner({
-    'git status': ok('M lib/commit.js\n'),
+    'git status': ok('M lib/commit.js\0'),
     'but branch': () => {
       controller.abort()
       return ok('Created branch feature-b\n')
@@ -561,7 +670,7 @@ test('a stop while the branch is being created commits nothing and keeps the pla
 
 test('a commit without a branch stays `but commit -m`, as before the plan existed', async () => {
   const { run, calls } = fakeRunner({
-    'git status': ok('M lib/commit.js\n'),
+    'git status': ok('M lib/commit.js\0'),
     'but commit': ok('Committed as 1a2b3c4\n'),
   })
 
