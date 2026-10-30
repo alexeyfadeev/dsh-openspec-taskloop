@@ -1,7 +1,8 @@
 // Tests for the task loop (tasks 4.2–4.3, 5.1): the wait between a message and the
 // next reading, the two ways a run can end — the task is checked and the run
 // advances, or it is not and the run stops without sending anything else — the
-// stop that ends a run from outside, and the session handoff at a group boundary.
+// stop that ends a run from outside, and the session handoff at a group boundary,
+// including the phase and the session id the loop publishes as the work moves.
 //
 // The agent is scripted rather than real: `whenIdle()` resolves on demand, so the
 // tests can pin that the plugin reads `tasks.md` only *after* the turn went quiet
@@ -15,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 
 import { COMPACTION_END, ON_FAILURE } from '../lib/compaction.js'
 import { GROUP_END, LOOP_END, runLoop } from '../lib/loop.js'
+import { RUN_PHASE, createRuns } from '../lib/runs.js'
 
 const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'apply')
 
@@ -507,6 +509,70 @@ test('a new group continues in a session opened for it, and the run stays there'
     'session idle',
     'read',
   ])
+})
+
+test('the run slot follows the phase of a boundary and the session the work moves into', async () => {
+  // 2.3 and 2.4 close group 2; 3.1 opens group 3 in a session of its own.
+  const both = tickedDocument([12, 13])
+  const { loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(progressedDocument()),
+    cliResult(both),
+    cliResult(both),
+  ])
+  const { run } = createRuns().start(CHANGE, { sessionId: 'session-1' })
+  const phases = []
+
+  const outcome = await loop({
+    onPhase: (phase) => run.setPhase(phase),
+    onSession: (sessionId) => run.setSession(sessionId),
+    onGroupComplete: () => {
+      // Read from the slot while the group is being closed: this is the moment a pause
+      // must not cancel a turn (design D5), so it is the moment the phase has to say so.
+      phases.push(run.phase)
+    },
+    openSession: async () => ({
+      sessionId: 'session-2',
+      followup() {},
+      async whenIdle() {},
+    }),
+  })
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.deepEqual(phases, [RUN_PHASE.boundary], 'a finished group is closed in the boundary phase')
+  assert.equal(run.phase, RUN_PHASE.task, 'the run leaves the boundary once the group is closed')
+  assert.equal(run.sessionId, 'session-2', 'the slot names the session the work moved into')
+})
+
+test('the run slot keeps the counts of the last reading, so a poll needs no CLI call', async () => {
+  // 2.3 is ticked after its turn, so the reading that follows reports one more task done
+  // than the one the run started from: the slot must show the latest counts it was told.
+  const { cli, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(progressedDocument()),
+    cliResult(progressedDocument()),
+  ])
+  const { run } = createRuns().start(CHANGE)
+  const seen = []
+
+  const outcome = await loop({
+    onProgress: (progress) => {
+      run.setProgress(progress)
+      seen.push(run.snapshot().progress)
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  // Every reading publishes its own counts, in the order the loop took them.
+  assert.deepEqual(seen, [
+    { complete: 4, total: 20 },
+    { complete: 5, total: 20 },
+    { complete: 5, total: 20 },
+  ])
+  // The snapshot itself is memory: three reads happened because three turns did, not
+  // because anybody asked for the state.
+  assert.deepEqual(run.snapshot().progress, { complete: 5, total: 20 })
+  assert.equal(cli.calls.length, 3)
 })
 
 test('a boundary without a way to open a session stops instead of continuing in place', async () => {
