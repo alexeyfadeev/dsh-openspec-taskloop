@@ -139,6 +139,34 @@ test('git stages the whole tree and then commits the message', () => {
   ])
 })
 
+// --- the openspec exclusion of a git commit (task 3.1, design D3) -----------
+
+test('with the setting off, git excludes openspec from staging and from the commit', () => {
+  // The pathspec is in both requests and starts after `--` (design D3): `git add`
+  // leaves `openspec/` out of the index, and `git commit` commits only what the same
+  // pathspec names, so a user's earlier `git add openspec/...` cannot ride along.
+  assert.deepEqual(
+    buildCommitCommands({ tool: 'git', message: GROUPED, openspec: false }),
+    [
+      { executable: 'git', args: ['add', '-A', '--', '.', ':(exclude)openspec'] },
+      { executable: 'git', args: ['commit', '-m', GROUPED, '--', '.', ':(exclude)openspec'] },
+    ],
+  )
+})
+
+test('with the setting on, git gets no pathspec at all', () => {
+  // `true` and the absent argument are the same request: a profile without the setting
+  // keeps the argv byte for byte, which is what makes the default behaviour unchanged.
+  const withSetting = buildCommitCommands({ tool: 'git', message: GROUPED, openspec: true })
+  assert.deepEqual(withSetting, buildCommitCommands({ tool: 'git', message: GROUPED }))
+  assert.deepEqual(withSetting, [
+    { executable: 'git', args: ['add', '-A'] },
+    { executable: 'git', args: ['commit', '-m', GROUPED] },
+  ])
+  // No request carries a `--` separator or a pathspec when every change is committed.
+  for (const request of withSetting) assert.equal(request.args.includes('--'), false)
+})
+
 test('GitButler commits with one `but commit -m` request', () => {
   assert.deepEqual(buildCommitCommands({ tool: 'gitbutler', message: GROUPED }), [
     { executable: 'but', args: ['commit', '-m', GROUPED] },
@@ -321,6 +349,125 @@ test('a blank status answer is still an empty tree', async () => {
   const outcome = await runCommit({ tool: 'git', text: TEXT, range: RANGE, cwd: '/repo', run })
 
   assert.equal(outcome.kind, COMMIT_END.empty)
+})
+
+test('with the setting off, a tree that changed only under openspec/ has nothing to commit', async () => {
+  // The gate filters before it counts (design D2/D5): every record belongs to
+  // `openspec/`, so the filtered set is empty and the tool is never asked to commit.
+  // The count of what stayed behind is the marker that tells this empty tree from a
+  // tree that had no changes at all — the report needs it to phrase the skip.
+  const { run, calls } = fakeRunner({
+    'git status': ok(' M openspec/changes/add-commit-openspec-toggle/tasks.md\0?? openspec/specs/new.md\0'),
+  })
+
+  const outcome = await runCommit({
+    tool: 'git',
+    text: TEXT,
+    range: RANGE,
+    openspec: false,
+    cwd: '/repo',
+    run,
+  })
+
+  assert.deepEqual(calls.map((call) => call.name), ['git status'])
+  assert.deepEqual(outcome, {
+    kind: COMMIT_END.empty,
+    tool: 'git',
+    message: GROUPED,
+    excluded: 2,
+  })
+})
+
+test('with the setting off, gitbutler also commits nothing when only openspec/ changed', async () => {
+  // The same gate answers for both tools (D2), so the branch is not created and no
+  // `but` request is made — the plan is left for a group that has something to commit.
+  const branch = { name: 'feature-a', exists: false }
+  const { run, calls } = fakeRunner({ 'git status': ok('?? openspec/project.md\0') })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler',
+    text: TEXT,
+    range: RANGE,
+    branch,
+    openspec: false,
+    cwd: '/repo',
+    run,
+  })
+
+  assert.deepEqual(calls.map((call) => call.name), ['git status'])
+  assert.deepEqual(outcome, {
+    kind: COMMIT_END.empty,
+    tool: 'gitbutler',
+    message: GROUPED,
+    branch: 'feature-a',
+    excluded: 1,
+  })
+  assert.equal(branch.exists, false)
+})
+
+// --- the count of what the commit left behind (task 3.3, design D5) --------
+
+test('with the setting off, a commit that went through counts the openspec/ changes it left', async () => {
+  // Both sides of the filter have changes, so this is a real commit: the requests carry
+  // the pathspec of task 3.1, and the outcome names how many changes under `openspec/`
+  // are still uncommitted — the number the report turns into a sentence (D5).
+  const { run, calls } = fakeRunner({
+    'git status': ok(
+      ' M lib/control.js\0 M openspec/changes/c/tasks.md\0?? openspec/specs/new.md\0',
+    ),
+    'git add': ok(),
+    'git commit': ok('[main 1a2b3c4] Добавить эндпоинт. Tasks 2.1 - 2.4\n'),
+  })
+
+  const outcome = await runCommit({
+    tool: 'git',
+    text: TEXT,
+    range: RANGE,
+    openspec: false,
+    cwd: '/repo',
+    run,
+  })
+
+  assert.deepEqual(calls.map((call) => call.name), ['git status', 'git add', 'git commit'])
+  // The boundary the gate counted is the one the tool is asked to commit (D2/D3).
+  assert.deepEqual(calls[1].args, ['add', '-A', '--', '.', ':(exclude)openspec'])
+  assert.deepEqual(calls[2].args, ['commit', '-m', GROUPED, '--', '.', ':(exclude)openspec'])
+  // Two of the three records are under `openspec/`; only the one outside it is committed.
+  assert.deepEqual(outcome, {
+    kind: COMMIT_END.committed,
+    tool: 'git',
+    message: GROUPED,
+    excluded: 2,
+    output: '[main 1a2b3c4] Добавить эндпоинт. Tasks 2.1 - 2.4',
+  })
+})
+
+test('with the setting on, a commit that went through carries no count at all', async () => {
+  // With the setting on the whole tree is the change set, `openspec/` included, so
+  // nothing was left behind and the outcome has no `excluded` field to report — the
+  // report of task 5.2 keys its extra sentence on exactly that absence.
+  const { run } = fakeRunner({
+    'git status': ok(' M openspec/changes/c/tasks.md\0?? openspec/specs/new.md\0'),
+    'git add': ok(),
+    'git commit': ok('[main 1a2b3c4] Добавить эндпоинт. Tasks 2.1 - 2.4\n'),
+  })
+
+  const outcome = await runCommit({
+    tool: 'git',
+    text: TEXT,
+    range: RANGE,
+    openspec: true,
+    cwd: '/repo',
+    run,
+  })
+
+  assert.equal(Object.hasOwn(outcome, 'excluded'), false)
+  assert.deepEqual(outcome, {
+    kind: COMMIT_END.committed,
+    tool: 'git',
+    message: GROUPED,
+    output: '[main 1a2b3c4] Добавить эндпоинт. Tasks 2.1 - 2.4',
+  })
 })
 
 test('a status check that fails stops the commit before anything is staged', async () => {
