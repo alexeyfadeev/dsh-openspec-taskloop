@@ -21,9 +21,12 @@ import { test } from 'node:test'
 
 import {
   COMMIT_END,
+  COMMIT_FILES_MAX,
   STATUS_COMMAND,
   buildCommitCommands,
   buildCommitMessage,
+  buildStageCommand,
+  buildUnstageCommand,
   commitIdOf,
   createButBranch,
   filterOpenspec,
@@ -68,6 +71,34 @@ function fakeRunner(answers, cwd = '/repo') {
   }
   return { run, calls }
 }
+
+/**
+ * `count` changed files outside `openspec/`, as the paths `git status` prints.
+ *
+ * The budget tests count in hundreds, so the paths are built instead of typed.
+ *
+ * @param {number} count - how many paths to produce.
+ * @returns {string[]} one path per file, in a stable order.
+ */
+function changedPaths(count) {
+  return Array.from({ length: count }, (_, index) => `lib/f${String(index)}.js`)
+}
+
+/**
+ * The untracked-file records of these paths, as `git status` reports them.
+ *
+ * @param {readonly string[]} paths - paths of newly added files.
+ * @returns {string[]} one `?? <path>` record per path.
+ */
+const untracked = (paths) => paths.map((path) => `?? ${path}`)
+
+/**
+ * The answer `git status --porcelain -z` gives for these records.
+ *
+ * @param {readonly string[]} records - entries, status characters and path.
+ * @returns {string} the NUL-terminated output.
+ */
+const statusOf = (records) => records.map((record) => `${record}\0`).join('')
 
 test('the commit message is the user text with the range of the group appended', () => {
   assert.equal(buildCommitMessage({ text: TEXT, range: RANGE }), GROUPED)
@@ -171,6 +202,482 @@ test('GitButler commits with one `but commit -m` request', () => {
   assert.deepEqual(buildCommitCommands({ tool: 'gitbutler', message: GROUPED }), [
     { executable: 'but', args: ['commit', '-m', GROUPED] },
   ])
+})
+
+// --- the openspec exclusion of a GitButler commit (task 4.1, design D4) -----
+
+test('with the setting off, GitButler names the files outside openspec/', () => {
+  // `but commit` has no exclusion flag, so the same boundary is the file list itself
+  // (D4): the message stays before the paths, and every path is one argv element — the
+  // space in `docs/a b.md` is part of the name, not a separator the tool would split on.
+  assert.deepEqual(
+    buildCommitCommands({
+      tool: 'gitbutler',
+      message: GROUPED,
+      branch: { name: 'feature-a', exists: true },
+      openspec: false,
+      files: ['lib/control.js', 'docs/a b.md'],
+    }),
+    [{
+      executable: 'but',
+      args: ['commit', '-b', 'feature-a', '-m', GROUPED, 'lib/control.js', 'docs/a b.md'],
+    }],
+  )
+})
+
+test('a new branch is created before the commit that names the files', () => {
+  // The order is the contract, as it is for a commit of the whole tree: the branch has to
+  // exist before the commit travels into it (D18), and the file list belongs to the
+  // commit, not to `but branch new`.
+  assert.deepEqual(
+    buildCommitCommands({
+      tool: 'gitbutler',
+      message: GROUPED,
+      branch: { name: 'feature-b', anchor: 'feature-a', exists: false },
+      openspec: false,
+      files: ['lib/commit.js'],
+    }),
+    [
+      { executable: 'but', args: ['branch', 'new', 'feature-b', '-A', 'feature-a'] },
+      { executable: 'but', args: ['commit', '-b', 'feature-b', '-m', GROUPED, 'lib/commit.js'] },
+    ],
+  )
+})
+
+test('with the setting on, GitButler names no file at all', () => {
+  // The whole tree is the change set, so there is nothing to single out: the argv is the
+  // one of a profile without the setting, whatever list a caller happens to pass.
+  const withSetting = buildCommitCommands({
+    tool: 'gitbutler',
+    message: GROUPED,
+    branch: { name: 'feature-a', exists: true },
+    openspec: true,
+    files: ['lib/control.js'],
+  })
+  assert.deepEqual(
+    withSetting,
+    buildCommitCommands({ tool: 'gitbutler', message: GROUPED, branch: { name: 'feature-a', exists: true } }),
+  )
+  assert.deepEqual(withSetting, [
+    { executable: 'but', args: ['commit', '-b', 'feature-a', '-m', GROUPED] },
+  ])
+})
+
+test('a file list that does not name paths is refused', () => {
+  // A path reaches the tool as argv: an empty one would be an argument that names
+  // nothing, and the group would fail after its work was already done.
+  assert.throws(
+    () => buildCommitCommands({ tool: 'gitbutler', message: GROUPED, openspec: false, files: 'lib/a.js' }),
+    /array of file paths/u,
+  )
+  assert.throws(
+    () => buildCommitCommands({ tool: 'gitbutler', message: GROUPED, openspec: false, files: [''] }),
+    /non-empty path/u,
+  )
+  assert.throws(
+    () => buildCommitCommands({ tool: 'gitbutler', message: GROUPED, openspec: false, files: [42] }),
+    /non-empty path/u,
+  )
+})
+
+test('a GitButler commit with the setting off names exactly the files the gate kept', async () => {
+  // The gate and the request speak about one change set (D2/D4): the records under
+  // `openspec/` are counted as left behind, and only the others become the file list.
+  const { run, calls } = fakeRunner({
+    'git status': ok(
+      ' M lib/control.js\0 M openspec/changes/c/tasks.md\0?? docs/a b.md\0',
+    ),
+    'git add': ok(),
+    'but commit': ok('Committed as 1a2b3c4\n'),
+  })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler',
+    text: TEXT,
+    range: RANGE,
+    branch: { name: 'feature-a', exists: true },
+    openspec: false,
+    cwd: '/repo',
+    run,
+  })
+
+  assert.deepEqual(calls.map((call) => call.name), ['git status', 'git add', 'but commit'])
+  // The staged list is the committed list (D19): a space in a path stays one element.
+  assert.deepEqual(calls[1].args, ['add', '--', 'lib/control.js', 'docs/a b.md'])
+  assert.deepEqual(calls[2].args, ['commit', '-b', 'feature-a', '-m', GROUPED, 'lib/control.js', 'docs/a b.md'])
+  assert.deepEqual(outcome, {
+    kind: COMMIT_END.committed,
+    tool: 'gitbutler',
+    message: GROUPED,
+    branch: 'feature-a',
+    excluded: 1,
+    output: 'Committed as 1a2b3c4',
+  })
+})
+
+test('a new branch made by a filtered commit is created once and named by the list', async () => {
+  // A plan that does not exist yet is created right before this commit, and the commit
+  // that follows carries the file list — the two features meet in one request pair.
+  const branch = createButBranch({ name: 'feature-b', anchor: 'feature-a' })
+  const { run, calls } = fakeRunner({
+    'git status': ok('?? lib/commit.js\0?? openspec/project.md\0'),
+    'but branch': ok('Created branch feature-b\n'),
+    'git add': ok(),
+    'but commit': ok('Committed as 1a2b3c4\n'),
+  })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler',
+    text: TEXT,
+    range: RANGE,
+    branch,
+    openspec: false,
+    cwd: '/repo',
+    run,
+  })
+
+  // The branch comes first, the staging second, the commit last: a branch that cannot be
+  // created then fails before the index is touched at all.
+  assert.deepEqual(calls.map((call) => call.name), ['git status', 'but branch', 'git add', 'but commit'])
+  assert.deepEqual(calls[1].args, ['branch', 'new', 'feature-b', '-A', 'feature-a'])
+  assert.deepEqual(calls[2].args, ['add', '--', 'lib/commit.js'])
+  assert.deepEqual(calls[3].args, ['commit', '-b', 'feature-b', '-m', GROUPED, 'lib/commit.js'])
+  assert.equal(outcome.kind, COMMIT_END.committed)
+  assert.equal(outcome.excluded, 1)
+  assert.equal(branch.exists, true)
+})
+
+// --- the file budget of a GitButler commit (task 4.2, design D4) ------------
+
+test('a file list past the budget names no file, and the commit takes openspec/ with it', async () => {
+  // The command line has a limit (D4): a list of 201 files is dropped instead of risked,
+  // so `but commit` names nothing and commits the whole tree. The changes under
+  // `openspec/` therefore go in, and the outcome has to say so — a count of changes left
+  // behind would describe a working tree that is not there.
+  const paths = changedPaths(COMMIT_FILES_MAX + 1)
+  const { run, calls } = fakeRunner({
+    'git status': ok(statusOf([...untracked(paths), ' M openspec/changes/c/tasks.md'])),
+    'but commit': ok('Committed as 1a2b3c4\n'),
+  })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler',
+    text: TEXT,
+    range: RANGE,
+    branch: { name: 'feature-a', exists: true },
+    openspec: false,
+    cwd: '/repo',
+    run,
+  })
+
+  assert.deepEqual(calls.map((call) => call.name), ['git status', 'but commit'])
+  assert.deepEqual(calls[1].args, ['commit', '-b', 'feature-a', '-m', GROUPED])
+  assert.deepEqual(outcome, {
+    kind: COMMIT_END.committed,
+    tool: 'gitbutler',
+    message: GROUPED,
+    branch: 'feature-a',
+    openspecIncluded: true,
+    output: 'Committed as 1a2b3c4',
+  })
+})
+
+test('a list of exactly the budget still names every file', async () => {
+  // The budget is the longest list the tool is given, not one path less: the degradation
+  // is the exception, and it must not start while the request still fits.
+  const paths = changedPaths(COMMIT_FILES_MAX)
+  const { run, calls } = fakeRunner({
+    'git status': ok(statusOf([...untracked(paths), ' M openspec/changes/c/tasks.md'])),
+    'git add': ok(),
+    'but commit': ok('Committed as 1a2b3c4\n'),
+  })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler',
+    text: TEXT,
+    range: RANGE,
+    branch: { name: 'feature-a', exists: true },
+    openspec: false,
+    cwd: '/repo',
+    run,
+  })
+
+  // The list at the budget is staged path for path (D19) and named in the commit after it.
+  assert.deepEqual(calls[1].args, ['add', '--', ...paths])
+  // `commit -b <branch> -m <msg>` is five elements before the first file.
+  assert.equal(calls[2].args.length, COMMIT_FILES_MAX + 5)
+  assert.deepEqual(calls[2].args.slice(5), paths)
+  assert.equal(outcome.excluded, 1)
+  assert.equal('openspecIncluded' in outcome, false)
+})
+
+test('a long list is a degradation only when the setting left openspec/ behind', async () => {
+  // The flag is about the directory going into the commit, not about the list being long.
+  // Nothing under `openspec/` means nothing rode along, and the setting on means the whole
+  // tree was the intended change set: neither may be reported as a boundary that broke.
+  const paths = changedPaths(COMMIT_FILES_MAX + 1)
+  for (const openspec of [false, true]) {
+    const { run } = fakeRunner({
+      'git status': ok(statusOf(untracked(paths))),
+      'but commit': ok('Committed as 1a2b3c4\n'),
+    })
+
+    const outcome = await runCommit({
+      tool: 'gitbutler',
+      text: TEXT,
+      range: RANGE,
+      branch: { name: 'feature-a', exists: true },
+      openspec,
+      cwd: '/repo',
+      run,
+    })
+
+    assert.equal('openspecIncluded' in outcome, false, `openspec: ${String(openspec)}`)
+    assert.equal('excluded' in outcome, false)
+  }
+})
+
+test('a commit that failed after the list was dropped claims nothing it did not do', async () => {
+  // The flag describes a commit that exists. A refusal leaves the directory in the working
+  // tree like any other change, so the ending is the failure and nothing else — the report
+  // must not add that `openspec/` went into a commit that never happened.
+  const paths = changedPaths(COMMIT_FILES_MAX + 1)
+  const { run } = fakeRunner({
+    'git status': ok(statusOf([...untracked(paths), ' M openspec/changes/c/tasks.md'])),
+    'but commit': no(1, { stderr: 'no branch is applied\n' }),
+  })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler',
+    text: TEXT,
+    range: RANGE,
+    branch: { name: 'feature-a', exists: true },
+    openspec: false,
+    cwd: '/repo',
+    run,
+  })
+
+  assert.equal(outcome.kind, COMMIT_END.failed)
+  assert.equal('openspecIncluded' in outcome, false)
+  assert.equal('excluded' in outcome, false)
+})
+
+// --- the index a GitButler commit is built from (task 4.4, design D19) ------
+
+test('the staging request names the files and adds nothing else', () => {
+  assert.deepEqual(
+    buildStageCommand({ tool: 'gitbutler', openspec: false, files: ['lib/a.js', 'docs/a b.md'] }),
+    { executable: 'git', args: ['add', '--', 'lib/a.js', 'docs/a b.md'] },
+  )
+  assert.throws(
+    () => buildStageCommand({ tool: 'gitbutler', openspec: false, files: [''] }),
+    /non-empty path/u,
+  )
+  assert.throws(
+    () => buildStageCommand({ tool: 'gitbutler', openspec: false, files: 'lib/a.js' }),
+    /array of file paths/u,
+  )
+})
+
+test('nothing is staged outside the named-file path of a GitButler commit', () => {
+  // The step belongs to the list, not to the commit (D19/D4): `git` stages the tree itself
+  // with `git add -A`, and the other two paths name no file at all — with the setting on
+  // the whole tree is the change set, past the budget the list is dropped. Staging any of
+  // them would widen what the commit carries, not prepare it.
+  const files = ['lib/a.js']
+  assert.equal(buildStageCommand({ tool: 'git', openspec: false, files }), undefined)
+  assert.equal(buildStageCommand({ tool: 'gitbutler', openspec: true, files }), undefined)
+  assert.equal(buildStageCommand({ tool: 'gitbutler', files }), undefined)
+  assert.equal(buildStageCommand({ tool: 'gitbutler', openspec: false, files: [] }), undefined)
+  assert.equal(buildStageCommand(), undefined)
+})
+
+test('the rollback resets the staged paths and only them', () => {
+  assert.deepEqual(buildUnstageCommand(['lib/a.js', 'docs/a b.md']), {
+    executable: 'git',
+    args: ['reset', '--', 'lib/a.js', 'docs/a b.md'],
+  })
+  // A reset that names nothing would empty the index instead of undoing this step (D3).
+  assert.throws(() => buildUnstageCommand([]), /at least one path/u)
+  assert.throws(() => buildUnstageCommand(['']), /non-empty path/u)
+})
+
+test('a filtered GitButler commit stages its files and never reaches openspec/', async () => {
+  // The order is the contract (D19): the tree is checked, the committed files are staged,
+  // and only then does `but` compose the commit out of that index. The staging request
+  // carries the committed paths and no pathspec, so the changes under `openspec/` stay out
+  // of the index and out of the commit, and no wildcard can reach them (D3).
+  const { run, calls } = fakeRunner({
+    'git status': ok(' M lib/control.js\0 M openspec/changes/c/tasks.md\0?? openspec/specs/new.md\0'),
+    'git add': ok(),
+    'but commit': ok('Committed as 1a2b3c4\n'),
+  })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler',
+    text: TEXT,
+    range: RANGE,
+    branch: { name: 'feature-a', exists: true },
+    openspec: false,
+    cwd: '/repo',
+    run,
+  })
+
+  assert.deepEqual(calls.map((call) => call.name), ['git status', 'git add', 'but commit'])
+  assert.deepEqual(calls[1].args, ['add', '--', 'lib/control.js'])
+  assert.deepEqual(calls[2].args, ['commit', '-b', 'feature-a', '-m', GROUPED, 'lib/control.js'])
+  // A commit that went through leaves the index as the commit left it: no rollback.
+  assert.equal(calls.some((call) => call.name === 'git reset'), false)
+  assert.deepEqual(outcome, {
+    kind: COMMIT_END.committed,
+    tool: 'gitbutler',
+    message: GROUPED,
+    branch: 'feature-a',
+    excluded: 2,
+    output: 'Committed as 1a2b3c4',
+  })
+})
+
+test('a commit that refused after the staging puts the index back', async () => {
+  // The commit that never happened must not leave the tree staged (D19). The rollback names
+  // the staged paths, so the changes under `openspec/` — and anything the user staged
+  // themselves — keep their state, and the ending is still the failure of `but commit`.
+  const { run, calls } = fakeRunner({
+    'git status': ok(' M lib/control.js\0?? docs/a.md\0'),
+    'git add': ok(),
+    'but commit': no(1, { stderr: 'no branch is applied\n' }),
+    'git reset': ok(),
+  })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler',
+    text: TEXT,
+    range: RANGE,
+    branch: { name: 'feature-a', exists: true },
+    openspec: false,
+    cwd: '/repo',
+    run,
+  })
+
+  assert.deepEqual(calls.map((call) => call.name), ['git status', 'git add', 'but commit', 'git reset'])
+  assert.deepEqual(calls[3].args, ['reset', '--', 'lib/control.js', 'docs/a.md'])
+  assert.equal(outcome.kind, COMMIT_END.failed)
+  assert.equal(outcome.command, 'but commit')
+  assert.equal(outcome.exitCode, 1)
+  assert.match(outcome.reason, /no branch is applied/u)
+})
+
+test('a rollback that failed does not replace the failure it cleans up after', async () => {
+  // The rollback is best effort: whatever it answers, the ending stays the reason the commit
+  // did not happen, because that is what the user can act on.
+  const { run } = fakeRunner({
+    'git status': ok(' M lib/control.js\0'),
+    'git add': ok(),
+    'but commit': no(1, { stderr: 'nothing to commit\n' }),
+    'git reset': no(128, { stderr: 'fatal: index.lock exists\n' }),
+  })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler',
+    text: TEXT,
+    range: RANGE,
+    branch: { name: 'feature-a', exists: true },
+    openspec: false,
+    cwd: '/repo',
+    run,
+  })
+
+  assert.equal(outcome.kind, COMMIT_END.failed)
+  assert.equal(outcome.command, 'but commit')
+  assert.match(outcome.reason, /nothing to commit/u)
+})
+
+test('a staging that failed is rolled back before the commit is attempted', async () => {
+  const { run, calls } = fakeRunner({
+    'git status': ok(' M lib/control.js\0'),
+    'git add': no(128, { stderr: 'fatal: pathspec is outside the repository\n' }),
+    'git reset': ok(),
+  })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler',
+    text: TEXT,
+    range: RANGE,
+    branch: { name: 'feature-a', exists: true },
+    openspec: false,
+    cwd: '/repo',
+    run,
+  })
+
+  // A `git add` that refused may have left part of the list staged, so the same rollback
+  // runs before the step ends, and `but` is never reached.
+  assert.deepEqual(calls.map((call) => call.name), ['git status', 'git add', 'git reset'])
+  assert.equal(outcome.kind, COMMIT_END.failed)
+  assert.equal(outcome.command, 'git add')
+  assert.match(outcome.reason, /pathspec is outside the repository/u)
+})
+
+test('a stop after the staging puts the index back', async () => {
+  const controller = new AbortController()
+  const { run, calls } = fakeRunner({
+    'git status': ok(' M lib/control.js\0'),
+    'git add': () => {
+      controller.abort()
+      return ok()
+    },
+    'git reset': ok(),
+  })
+
+  const outcome = await runCommit({
+    tool: 'gitbutler',
+    text: TEXT,
+    range: RANGE,
+    branch: { name: 'feature-a', exists: true },
+    openspec: false,
+    cwd: '/repo',
+    run,
+    signal: controller.signal,
+  })
+
+  assert.deepEqual(calls.map((call) => call.name), ['git status', 'git add', 'git reset'])
+  assert.equal(outcome.kind, COMMIT_END.stopped)
+})
+
+test('a tree that names no file is never staged, whatever the tool and the setting', async () => {
+  // Three paths that ask for no staging at all: `git` stages the tree with its own `-A`,
+  // the setting on commits the whole tree, and past the budget the list is dropped (D4).
+  // A `git add` request here would be a staging the commit did not ask for.
+  const overBudget = changedPaths(COMMIT_FILES_MAX + 1)
+
+  const gitRun = fakeRunner({
+    'git status': ok(' M lib/a.js\0'),
+    'git add': ok(),
+    'git commit': ok('[main 1a2b3c4] x\n'),
+  })
+  await runCommit({ tool: 'git', text: TEXT, range: RANGE, openspec: false, cwd: '/repo', run: gitRun.run })
+  assert.deepEqual(gitRun.calls[1].args, ['add', '-A', '--', '.', ':(exclude)openspec'])
+
+  const wholeTree = fakeRunner({
+    'git status': ok(' M lib/a.js\0'),
+    'but commit': ok('Committed as 1a2b3c4\n'),
+  })
+  await runCommit({
+    tool: 'gitbutler', text: TEXT, range: RANGE, branch: { name: 'feature-a', exists: true },
+    openspec: true, cwd: '/repo', run: wholeTree.run,
+  })
+  assert.deepEqual(wholeTree.calls.map((call) => call.name), ['git status', 'but commit'])
+
+  // No `git add` answer is registered, so a staging request would throw instead of passing.
+  const dropped = fakeRunner({
+    'git status': ok(statusOf(untracked(overBudget))),
+    'but commit': ok('Committed as 1a2b3c4\n'),
+  })
+  const outcome = await runCommit({
+    tool: 'gitbutler', text: TEXT, range: RANGE, branch: { name: 'feature-a', exists: true },
+    openspec: false, cwd: '/repo', run: dropped.run,
+  })
+  assert.deepEqual(dropped.calls.map((call) => call.name), ['git status', 'but commit'])
+  assert.equal(outcome.openspecIncluded, undefined)
 })
 
 test('every tool the configuration accepts has a commit plan', () => {
