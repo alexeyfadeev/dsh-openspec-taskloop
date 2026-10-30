@@ -36,7 +36,7 @@ const CONFIG_ENTRY = 'openspec-taskloop'
 
 /** A resolved config block, with every field set away from its default. */
 const VALUE = {
-  commit: { enabled: false, tool: 'gitbutler' },
+  commit: { enabled: false, openspec: false, tool: 'gitbutler' },
   review: { enabled: false },
   pause: { enabled: true },
   compaction: {
@@ -344,16 +344,17 @@ test('apply mounts the page into settings.section under the designed identity', 
   assert.match(page.effects[0], /settings page/u, 'the effect is named for what it owns')
 })
 
-test('the page shows the seven switches and choices the config holds', () => {
+test('the page shows the eight switches and choices the config holds', () => {
   const page = mount(createForm({ status: 'ready', writable: true, value: VALUE }))
   const nodes = page.render()
   const switches = switchesOf(nodes)
   const segments = segmentsOf(nodes)
 
-  assert.equal(switches.length, 5, 'five settings are switches')
+  assert.equal(switches.length, 6, 'six settings are switches')
   assert.equal(segments.length, 2, 'two settings are choices')
 
   assert.equal(controlLabelled(switches, 'Commit after each task group').props.checked, false)
+  assert.equal(controlLabelled(switches, 'Commit openspec files').props.checked, false)
   assert.equal(controlLabelled(switches, 'Code review after each task group').props.checked, false)
   assert.equal(controlLabelled(switches, 'Pause after each task group').props.checked, true)
   assert.equal(controlLabelled(switches, 'Compact inside a task').props.checked, true)
@@ -378,6 +379,7 @@ test('each control writes its own field, with no Save button in between', async 
   const nodes = page.render()
 
   controlLabelled(switchesOf(nodes), 'Commit after each task group').props.onChange(true)
+  controlLabelled(switchesOf(nodes), 'Commit openspec files').props.onChange(true)
   controlLabelled(segmentsOf(nodes), 'Commit tool').props.onChange('git')
   controlLabelled(switchesOf(nodes), 'Code review after each task group').props.onChange(true)
   controlLabelled(switchesOf(nodes), 'Pause after each task group').props.onChange(false)
@@ -388,6 +390,7 @@ test('each control writes its own field, with no Save button in between', async 
 
   assert.deepEqual(form.writes, [
     [{ op: 'set', path: ['commit', 'enabled'], value: true }],
+    [{ op: 'set', path: ['commit', 'openspec'], value: true }],
     [{ op: 'set', path: ['commit', 'tool'], value: 'git' }],
     [{ op: 'set', path: ['review', 'enabled'], value: true }],
     [{ op: 'set', path: ['pause', 'enabled'], value: false }],
@@ -401,7 +404,7 @@ test('the page shows the three retry numbers in the units the page promises', ()
   const page = mount(createForm({ status: 'ready', writable: true, value: VALUE }))
   const inputs = inputsOf(page.render())
 
-  assert.equal(inputs.length, 3, 'three of the ten settings are numbers')
+  assert.equal(inputs.length, 3, 'three of the eleven settings are numbers')
 
   assert.equal(inputLabelled(inputs, 'Compaction attempts').props.value, '5')
   assert.equal(
@@ -468,18 +471,26 @@ test('a refused retry number goes back to the snapshot value and says so', async
   )
 })
 
-test('the pause row is the seventh setting, and writes pause.enabled', async () => {
+test('the switches sit in the order the design fixes, and the pause row writes pause.enabled', async () => {
   const form = createForm({ status: 'ready', writable: true, value: VALUE })
   const page = mount(form)
 
   const labels = switchesOf(page.render()).map((node) => node.props.label)
   assert.deepEqual(labels, [
     'Commit after each task group',
+    'Commit openspec files',
     'Code review after each task group',
     'Pause after each task group',
     'Compact inside a task',
     'Protocol section',
-  ], 'the pause row sits right after code review and ahead of compaction (D12)')
+  ], 'the openspec switch follows the commit switch, and the protocol section sits next to compaction inside a task (D6)')
+
+  form.set({ value: { ...VALUE, commit: { ...VALUE.commit, openspec: true } } })
+  assert.equal(
+    controlLabelled(switchesOf(page.render()), 'Commit openspec files').props.checked,
+    true,
+    'the openspec switch shows commit.openspec',
+  )
 
   controlLabelled(switchesOf(page.render()), 'Pause after each task group').props.onChange(false)
   await settle()
@@ -627,7 +638,7 @@ test('the README names every settings row the way the page shows it', () => {
     ...segmentsOf(nodes).map((node) => node.props.label),
     ...inputsOf(nodes).map((node) => node.props['aria-label']),
   ]
-  assert.equal(labels.length, 10, 'the page has ten settings, so the README documents ten')
+  assert.equal(labels.length, 11, 'the page has eleven settings, so the README documents eleven')
   for (const label of labels) {
     assert.ok(readme.includes(label), `the README must name the row "${label}" exactly as the page does`)
   }

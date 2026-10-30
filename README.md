@@ -148,20 +148,21 @@ had.
 ## Settings dsh
 
 **Settings dsh → OpenSpec Taskloop**, the page that sits right behind General and Models and edits this plugin's
-own configuration block. Ten rows:
+own configuration block. Eleven rows:
 
 | What the page shows | Field | Default | What it turns on |
 | --- | --- | --- | --- |
 | Commit after each task group | `commit.enabled` | on | Commit the working tree once the last task of a group is verified, using the message given at the start of the run plus the task range of the group. |
+| Commit openspec files | `commit.openspec` | on | Include the changes under `openspec/` — the task ticks, the spec and design edits — in the commit of each group. Off, the commit holds only what the group changed elsewhere, and a group that touched nothing else reports that there was nothing to commit outside `openspec/`. |
 | Commit tool | `commit.tool` | Git | `git` (`git add -A`, then `git commit -m`) or GitButler's `but commit -b <branch> -m`, which asks for the branch — a new name also asks what it stacks on — at the start of each run and needs GitButler 0.22.0 or newer. Read at the moment of the commit, so the tool can be switched without restarting a run. |
 | Code review after each task group | `review.enabled` | on | Review the finished group in a session of its own, before the next group starts and before the commit. |
 | Pause after each task group | `pause.enabled` | off | End the run on the group boundary instead of handing the next group a session of its own: review and commit still run, then the report names the closed group and the task the next `/taskloop` continues from. |
 | Compact inside a task | `compaction.midTask` | off | Ask for compaction by context pressure on a step boundary, not only between tasks. |
+| Protocol section | `protocol.systemSection` | off | Register the static protocol section on every agent the run drives. |
 | When the compaction budget runs out | `compaction.onFailure` | Break | `Break` stops the run and reports the blocked task; `Continue` records a warning in the report and sends the next task anyway. |
 | Compaction attempts | `compaction.retry.attempts` | 4 | Calls to compaction on one transition between tasks, the first one included: four attempts are three waits, and a compaction that succeeds waits for none of them. |
 | First retry wait (seconds) | `compaction.retry.delayMs` | 40 | How long the run waits after the first failed compaction. The page asks for seconds and stores milliseconds. |
 | Retry wait multiplier | `compaction.retry.factor` | 1.5 | Every further wait is this many times the previous one; `1` waits the same every time. |
-| Protocol section | `protocol.systemSection` | off | Register the static protocol section on every agent the run drives. |
 
 There is no Save button: every row writes as soon as it is used, through the same config form the built-in pages
 use, so the value lands in the profile's `cordis.patch.yml` and the next run applies it — no Harness restart. A
@@ -180,7 +181,7 @@ the stored values, so it moves when a write lands rather than while a number is 
 survive a summary taken mid-task: on its own it describes a run that is bounded only between tasks, which is
 already the case without it.
 
-The page is the plugin's only place for these ten values; the rest of the block below is a profile decision. And
+The page is the plugin's only place for these eleven values; the rest of the block below is a profile decision. And
 because the page is this plugin's own, there is no second, generated copy of it under Settings → Plugins.
 
 ## Configuration
@@ -191,6 +192,7 @@ because the page is this plugin's own, there is no second, generated copy of it 
     change: ''                     # empty: the change with the latest lastModified
     commit:
       enabled: true                # Commit after each task group
+      openspec: true               # Commit openspec files
       tool: git                    # git | gitbutler
     review:
       enabled: true                # Code review after each task group
@@ -211,7 +213,7 @@ because the page is this plugin's own, there is no second, generated copy of it 
       timeoutMs: 120000            # deadline of one openspec call
 ```
 
-The ten fields the page edits are volatile: they are read when they apply, so a change is picked up by the next
+The eleven fields the page edits are volatile: they are read when they apply, so a change is picked up by the next
 run. `compaction.retry.attempts`, `delayMs` and `factor` are volatile too, and are read at the start of every
 transition between tasks rather than once when the plugin is created — another provider means another quota window,
 so these three numbers belong to the page. `compaction.retry.codes` and `compaction.retry.maxDelayMs` stay in the

@@ -34,8 +34,8 @@
 
 ## 6. Страница настроек
 
-- [ ] 6.1 В `lib/client.js` добавить тексты `commitOpenspec` и `commitOpenspecHint`, строку-переключатель второй (сразу после `Commit after each task group`) с полем `['commit', 'openspec']`, и перенести `Protocol section` вплотную к `Compact inside a task`; проверить тестом `test/client.test.mjs` список подписей переключателей в порядке рендера.
-- [ ] 6.2 Обновить счётчики и проверки в `test/client.test.mjs`: шесть переключателей вместо пяти, запись `['commit', 'openspec']` в списке вызовов, порядок строк; проверить, что `node --test --test-isolation=none test/client.test.mjs` зелёный и ни один тест не опирается на прежний порядок.
+- [x] 6.1 В `lib/client.js` добавить тексты `commitOpenspec` и `commitOpenspecHint`, строку-переключатель второй (сразу после `Commit after each task group`) с полем `['commit', 'openspec']`, и перенести `Protocol section` вплотную к `Compact inside a task`; проверить тестом `test/client.test.mjs` список подписей переключателей в порядке рендера.
+- [x] 6.2 Обновить счётчики и проверки в `test/client.test.mjs`: шесть переключателей вместо пяти, запись `['commit', 'openspec']` в списке вызовов, порядок строк; проверить, что `node --test --test-isolation=none test/client.test.mjs` зелёный и ни один тест не опирается на прежний порядок.
 
 ## 7. Документация
 
