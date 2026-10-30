@@ -730,10 +730,10 @@ test('a finished group is committed after its review, with the message as one ar
   )
 })
 
-test('a run asked to pause ends at the group boundary and opens no session for the next one', async () => {
-  // 2.4's turn closes group 2. With the pause on (10.4, design D21) the boundary still
-  // reviews and commits the group — the pause is the last step of that boundary, not a
-  // branch around it — and only then ends the run, instead of opening the session that
+test('a run asked to stop at a group boundary ends there and opens no session for the next one', async () => {
+  // 2.4's turn closes group 2. With the boundary stop on (10.4, design D21) the boundary
+  // still reviews and commits the group — the stop is the last step of that boundary, not
+  // a branch around it — and only then ends the run, instead of opening the session that
   // would take group 3.
   const both = tickedApply([12, 13])
   const cli = scriptedCli([
@@ -751,7 +751,7 @@ test('a run asked to pause ends at the group boundary and opens no session for t
   const opened = []
   const { control, messages, agent } = harness({
     createCli: () => cli,
-    config: { pause: { enabled: true } },
+    config: { boundary: { enabled: true } },
     commitInput: async () => {
       events.push('text')
       return { kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }
@@ -767,7 +767,7 @@ test('a run asked to pause ends at the group boundary and opens no session for t
 
   const result = await control.run(invocation(agent), { change: null })
 
-  // The whole boundary ran, in order, and the pause came after the commit: the session
+  // The whole boundary ran, in order, and the stop came after the commit: the session
   // of group 3 was never even asked for.
   assert.deepEqual(events, ['text', 'open review', 'git status', 'git add', 'git commit'])
   assert.deepEqual(opened, ['review-1'])
@@ -780,18 +780,18 @@ test('a run asked to pause ends at the group boundary and opens no session for t
   assert.match(result.text, /The commit of tasks 2\.1 - 2\.4 through git went through/u)
   assert.match(
     result.text,
-    /The run paused after tasks 2\.1 - 2\.4: no further task was sent, and \/taskloop continues with task 3\.1\./u,
+    /The run stopped at the boundary of task group 2 \(tasks 2\.1 - 2\.4\): no further task was sent, and the next \/taskloop continues from task 3\.1\./u,
   )
   assert.doesNotMatch(result.text, /The run moved to/u)
   // 3.1 was never sent: both messages are the tasks of the group that closed.
   assert.equal(messages.length, 2)
-  assert.equal(cli.calls.length, 4, 'no reading followed the pause')
+  assert.equal(cli.calls.length, 4, 'no reading followed the boundary stop')
 })
 
-test('a pause needs no commit switch: the boundary alone ends the run', async () => {
-  // The pause is a setting of its own (10.4): a run with reviews and commits off still
-  // has group boundaries, and the hook exists for them. Without it the loop would open
-  // the session of group 3 exactly as it did before the setting existed.
+test('a boundary stop needs no commit switch: the boundary alone ends the run', async () => {
+  // The boundary stop is a setting of its own (10.4): a run with reviews and commits off
+  // still has group boundaries, and the hook exists for them. Without it the loop would
+  // open the session of group 3 exactly as it did before the setting existed.
   const both = tickedApply([12, 13])
   const cli = scriptedCli([
     cliResult(fixture('repo.json')),
@@ -802,7 +802,7 @@ test('a pause needs no commit switch: the boundary alone ends the run', async ()
   const opened = []
   const { control, messages, agent } = harness({
     createCli: () => cli,
-    config: { review: { enabled: false }, commit: { enabled: false }, pause: { enabled: true } },
+    config: { review: { enabled: false }, commit: { enabled: false }, boundary: { enabled: true } },
     commitInput: async () => {
       throw new Error('a run with commits off must not ask for a commit message')
     },
@@ -819,17 +819,18 @@ test('a pause needs no commit switch: the boundary alone ends the run', async ()
   assert.equal(messages.length, 2)
   assert.match(
     result.text,
-    /The run paused after tasks 2\.1 - 2\.4: no further task was sent, and \/taskloop continues with task 3\.1\./u,
+    /The run stopped at the boundary of task group 2 \(tasks 2\.1 - 2\.4\): no further task was sent, and the next \/taskloop continues from task 3\.1\./u,
   )
   // Nothing was reviewed or committed, so the report claims neither.
   assert.doesNotMatch(result.text, /The review of/u)
   assert.doesNotMatch(result.text, /The commit of/u)
 })
 
-test('a group whose commit has no message text still pauses after its turn', async () => {
-  // A pause is not a reward for a commit that went through: the group is closed either
-  // way, and the skip already has a sentence of its own (5.2). The run therefore ends at
-  // the boundary rather than opening the next group's session over an uncommitted tree.
+test('a group whose commit has no message text still stops at its boundary', async () => {
+  // A boundary stop is not a reward for a commit that went through: the group is closed
+  // either way, and the skip already has a sentence of its own (5.2). The run therefore
+  // ends at the boundary rather than opening the next group's session over an uncommitted
+  // tree.
   const both = tickedApply([12, 13])
   const cli = scriptedCli([
     cliResult(fixture('repo.json')),
@@ -841,7 +842,7 @@ test('a group whose commit has no message text still pauses after its turn', asy
   const opened = []
   const { control, agent } = harness({
     createCli: () => cli,
-    config: { review: { enabled: false }, pause: { enabled: true } },
+    config: { review: { enabled: false }, boundary: { enabled: true } },
     runCommitCommand: tool.run,
     openSession: async (invocation, context) => {
       opened.push(context)
@@ -858,7 +859,7 @@ test('a group whose commit has no message text still pauses after its turn', asy
     result.text,
     /The commit of tasks 2\.1 - 2\.4 was skipped: the run has no commit message text\./u,
   )
-  assert.match(result.text, /The run paused after tasks 2\.1 - 2\.4/u)
+  assert.match(result.text, /The run stopped at the boundary of task group 2/u)
 })
 
 test('the session that drove the group gets the commit id as soon as the tool commits', async () => {
@@ -1185,13 +1186,13 @@ test('with the setting on, a commit that went through carries no sentence about 
   assert.doesNotMatch(result.text, /The commit left/u)
 })
 
-test('with the setting off, a group whose work stayed in openspec/ still pauses after its boundary', async () => {
+test('with the setting off, a group whose work stayed in openspec/ still stops at its boundary', async () => {
   // The empty outcome is the same outcome it has always been (D5): a tree with nothing
   // to commit outside `openspec/` is a skip, not a failing commit. The boundary still
-  // runs — the review of the finished group comes first — and the pause is its last step
-  // (design D21), exactly as it is after a commit that went through. A run must not read
-  // as broken because the work it just finished happened to land where the setting keeps
-  // it out of the history.
+  // runs — the review of the finished group comes first — and the boundary stop is its
+  // last step (design D21), exactly as it is after a commit that went through. A run must
+  // not read as broken because the work it just finished happened to land where the
+  // setting keeps it out of the history.
   const both = tickedApply([12, 13])
   const cli = scriptedCli([
     cliResult(fixture('repo.json')),
@@ -1205,7 +1206,7 @@ test('with the setting off, a group whose work stayed in openspec/ still pauses 
   const opened = []
   const { control, messages, agent } = harness({
     createCli: () => cli,
-    config: { commit: { openspec: false }, pause: { enabled: true } },
+    config: { commit: { openspec: false }, boundary: { enabled: true } },
     commitInput: async () => ({ kind: COMMIT_TEXT.text, text: 'Добавить эндпоинт' }),
     runCommitCommand: tool.run,
     openSession: async (invocation, context) => {
@@ -1229,20 +1230,20 @@ test('with the setting off, a group whose work stayed in openspec/ still pauses 
   )
   assert.match(
     result.text,
-    /The run paused after tasks 2\.1 - 2\.4: no further task was sent, and \/taskloop continues with task 3\.1\./u,
+    /The run stopped at the boundary of task group 2 \(tasks 2\.1 - 2\.4\): no further task was sent, and the next \/taskloop continues from task 3\.1\./u,
   )
-  // No commit failed: the skip is a sentence of the boundary, and the pause is the only
-  // thing that ended the run.
+  // No commit failed: the skip is a sentence of the boundary, and the boundary stop is the
+  // only thing that ended the run.
   assert.doesNotMatch(result.text, /the commit of tasks 2\.1 - 2\.4 through git failed/u)
   assert.doesNotMatch(result.text, /The run moved to/u)
   assert.match(control.status().text, /no run is active/u)
   assert.equal(messages.length, 2)
-  assert.equal(cli.calls.length, 4, 'no reading followed the pause')
+  assert.equal(cli.calls.length, 4, 'no reading followed the boundary stop')
 })
 
 test('with the setting off, an empty filtered tree does not end the run before the next group', async () => {
-  // Without the pause the loop goes on to group 3, exactly as it does after any other
-  // skip (D5): the empty tree is a sentence of the report, never a result of the run.
+  // Without the boundary stop the loop goes on to group 3, exactly as it does after any
+  // other skip (D5): the empty tree is a sentence of the report, never a result of the run.
   // The session that takes over is the same one a commit that went through would open.
   const both = tickedApply([12, 13])
   const cli = scriptedCli([

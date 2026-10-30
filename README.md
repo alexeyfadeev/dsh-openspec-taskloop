@@ -42,8 +42,8 @@ task and the file. Nothing else moves the run forward — an argument the comman
 the usage text and sends nothing.
 
 Task ids of the form `N.M` form **groups**. When the last task of a group is verified, the run continues in a
-session it opens itself, and the report in the original session says which one — unless **Pause after each task
-group** makes that boundary the end of the run instead, as described below. A flat list (no `N.M` ids) has no groups
+session it opens itself, and the report in the original session says which one — unless **Stop at each task group
+boundary** makes that boundary the end of the run instead, as described below. A flat list (no `N.M` ids) has no groups
 and stays in one session.
 
 A finished group is reviewed before the next one starts. A session of its own — not the one the next group will
@@ -128,16 +128,16 @@ the record is deleted, and the next `/taskloop` for that change asks for a sente
 than reusing the old one; a record the run cannot delete is reported as a warning instead of failing a finished
 run. Cancelling the question starts nothing at all: no message goes to the model and no file is touched.
 
-**Pause after each task group** ends the run at the boundary instead of crossing it. The pause is the last step of
-that boundary, so the review of the group runs and the commit lands exactly as they do otherwise; only after them
-does the run end — no session is opened for the next group, nothing is sent to one, and no run stays active. The
-report names the group the run ended with, what became of its commit, and the task the next `/taskloop` continues
-from; the message you gave is still there for that run, as after a stop. That `/taskloop` continues there, in the
-session where you type it — which is the point of the setting and also its cost: while it is on, a fresh session for
-every group stops being a guarantee, and the next group carries whatever context the session you typed in has. The
-final group of a change and a flat list never pause, because a run with nothing left to continue is finished rather
-than paused, and a commit the tool refuses ends the run with that failure, as it always does, instead of with a pause
-after it. Off by default.
+**Stop at each task group boundary** ends the run at the boundary instead of crossing it. The stopping point is the
+last step of that boundary, so the review of the group runs and the commit lands exactly as they do otherwise; only
+after them does the run end — no session is opened for the next group, nothing is sent to one, and no run stays
+active. The report names the group the run stopped at, what became of its commit, and the task the next `/taskloop`
+continues from; the message you gave is still there for that run, as after a stop. That `/taskloop` continues there,
+in the session where you type it — which is the point of the setting and also its cost: while it is on, a fresh
+session for every group stops being a guarantee, and the next group carries whatever context the session you typed in
+has. The final group of a change and a flat list never stop at a boundary, because a run with nothing left to
+continue is finished rather than stopped there, and a commit the tool refuses ends the run with that failure, as it
+always does, rather than at the boundary after it. Off by default.
 
 Between tasks of a group the run compacts its own context, retrying a transient failure up to the configured
 budget. What happens when that budget is spent is the `compaction.onFailure` setting: `break` withholds the next
@@ -172,7 +172,7 @@ own configuration block. Eleven rows:
 | Commit openspec files | `commit.openspec` | on | Include the changes under `openspec/` — the task ticks, the spec and design edits — in the commit of each group. Off, the commit holds only what the group changed elsewhere, and a group that touched nothing else reports that there was nothing to commit outside `openspec/`. |
 | Commit tool | `commit.tool` | Git | `git` (`git add -A`, then `git commit -m`) or GitButler's `but commit -b <branch> -m`, which asks for the branch — a new name also asks what it stacks on — at the start of each run and needs GitButler 0.22.0 or newer. Read at the moment of the commit, so the tool can be switched without restarting a run. |
 | Code review after each task group | `review.enabled` | on | Review the finished group in a session of its own, before the next group starts and before the commit. |
-| Pause after each task group | `pause.enabled` | off | End the run on the group boundary instead of handing the next group a session of its own: review and commit still run, then the report names the closed group and the task the next `/taskloop` continues from. |
+| Stop at each task group boundary | `boundary.enabled` | off | End the run at the group boundary instead of handing the next group a session of its own: review and commit still run, then the report names the group the run stopped at and the task the next `/taskloop` continues from. |
 | Compact inside a task | `compaction.midTask` | off | Ask for compaction by context pressure on a step boundary, not only between tasks. |
 | Protocol section | `protocol.systemSection` | off | Register the static protocol section on every agent the run drives. |
 | When the compaction budget runs out | `compaction.onFailure` | Break | `Break` stops the run and reports the blocked task; `Continue` records a warning in the report and sends the next task anyway. |
@@ -212,8 +212,8 @@ because the page is this plugin's own, there is no second, generated copy of it 
       tool: git                    # git | gitbutler
     review:
       enabled: true                # Code review after each task group
-    pause:
-      enabled: false               # Pause after each task group
+    boundary:
+      enabled: false               # Stop at each task group boundary
     compaction:
       midTask: false               # Compact inside a task
       onFailure: break             # continue | break

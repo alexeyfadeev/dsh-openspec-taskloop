@@ -12,8 +12,11 @@
 // the new fields really are references rather than plain values. The same holds
 // for `compaction.midTask`, `compaction.onFailure` and `protocol.systemSection`,
 // which D12 moved to volatile without changing their defaults or their meaning.
-// The `pause` switch (D21) joins them: volatile, off by default, and documented
-// in the same `config-defaults` block rather than in the base contract.
+// The `boundary` switch (D21) joins them: volatile, off by default, and documented
+// in the same `config-defaults` block rather than in the base contract. A change that
+// renames a key documents the old one as `null` (`add-pause-resume-ui`, D10): the block
+// of the change that introduced the key stays in the union, so such a key is removed
+// from the merged defaults instead of being added by the newer block.
 // `add-compaction-retry-settings` (D1) turns `retry.attempts`, `retry.delayMs` and
 // `retry.factor` volatile too, but deliberately not `retry.codes` or
 // `retry.maxDelayMs` — those two must keep no page row at all.
@@ -108,12 +111,30 @@ function volatilePaths(value, prefix = []) {
 function mergeDefaults(base, addition) {
   const result = { ...base }
   for (const [key, value] of Object.entries(addition)) {
+    // `null` retires the key: the block that introduced it stays in the union, so the
+    // removal is applied to the merged result rather than in place (D10).
+    if (value === null) continue
     const previous = result[key]
     result[key] = isPlainObject(previous) && isPlainObject(value)
       ? mergeDefaults(previous, value)
       : value
   }
   return result
+}
+
+/**
+ * Top-level keys that some change retires by documenting them as `null`.
+ *
+ * A rename cannot be expressed by the newer block alone: the older change keeps
+ * documenting the key it introduced, wherever that change lives now.
+ *
+ * @param {object[]} blocks - parsed `config-defaults` blocks.
+ * @returns {string[]} keys to remove from the merged defaults.
+ */
+function retiredKeys(blocks) {
+  return [...new Set(blocks.flatMap((block) => Object.entries(block)
+    .filter(([, value]) => value === null)
+    .map(([key]) => key)))]
 }
 
 /**
@@ -208,7 +229,9 @@ function defaultsBlocks(text) {
 }
 
 test('defaults resolved by the schema equal the ones documented in design.md', () => {
-  const documented = documentedAdditions().reduce(mergeDefaults, documentedDefaults(readDesignDoc()))
+  const blocks = documentedAdditions()
+  const documented = blocks.reduce(mergeDefaults, documentedDefaults(readDesignDoc()))
+  for (const key of retiredKeys(blocks)) delete documented[key]
   assert.deepEqual(plain(resolveConfig()), documented)
 })
 
@@ -244,26 +267,28 @@ test('commit and review are volatile fields with the documented defaults', () =>
   assert.equal(config.review.enabled.get(), true)
 })
 
-test('pause is a volatile field, off by default', () => {
+test('boundary is a volatile field, off by default', () => {
   const config = resolveConfig()
 
-  // The pause switch (D21) is the seventh setting of the page, so it is a
+  // The boundary switch (D21) is the seventh setting of the page, so it is a
   // reference like the commit and review fields: Settings can only show and
-  // write volatile fields.
-  assert.ok(isVolatileRef(config.pause.enabled), 'pause.enabled must be volatile')
-  assert.equal(config.pause.enabled.get(), false)
-  assert.equal(resolveConfig({ pause: { enabled: true } }).pause.enabled.get(), true)
+  // write volatile fields. The old `pause` key is gone: the word names the
+  // command now (`add-pause-resume-ui`, D10).
+  assert.equal('pause' in config, false, 'the retired pause key must not resolve')
+  assert.ok(isVolatileRef(config.boundary.enabled), 'boundary.enabled must be volatile')
+  assert.equal(config.boundary.enabled.get(), false)
+  assert.equal(resolveConfig({ boundary: { enabled: true } }).boundary.enabled.get(), true)
 })
 
-test('enabling the pause leaves every other default untouched', () => {
-  const { pause: pausedSwitch, ...pausedRest } = plain(resolveConfig({ pause: { enabled: true } }))
-  const { pause: defaultSwitch, ...defaultRest } = plain(resolveConfig())
+test('enabling the boundary stop leaves every other default untouched', () => {
+  const { boundary: stoppedSwitch, ...stoppedRest } = plain(resolveConfig({ boundary: { enabled: true } }))
+  const { boundary: defaultSwitch, ...defaultRest } = plain(resolveConfig())
 
   // D21 changes where a run stops, not how any other setting resolves: with the
-  // pause key removed, a paused config is byte-for-byte the empty-block config.
-  assert.deepEqual(pausedSwitch, { enabled: true })
+  // boundary key removed, a stopped config is byte-for-byte the empty-block config.
+  assert.deepEqual(stoppedSwitch, { enabled: true })
   assert.deepEqual(defaultSwitch, { enabled: false })
-  assert.deepEqual(pausedRest, defaultRest)
+  assert.deepEqual(stoppedRest, defaultRest)
 })
 
 test('both commit tools are accepted, an unknown one is rejected', () => {

@@ -38,7 +38,7 @@ const CONFIG_ENTRY = 'openspec-taskloop'
 const VALUE = {
   commit: { enabled: false, openspec: false, tool: 'gitbutler' },
   review: { enabled: false },
-  pause: { enabled: true },
+  boundary: { enabled: true },
   compaction: {
     midTask: true,
     onFailure: 'continue',
@@ -356,7 +356,7 @@ test('the page shows the eight switches and choices the config holds', () => {
   assert.equal(controlLabelled(switches, 'Commit after each task group').props.checked, false)
   assert.equal(controlLabelled(switches, 'Commit openspec files').props.checked, false)
   assert.equal(controlLabelled(switches, 'Code review after each task group').props.checked, false)
-  assert.equal(controlLabelled(switches, 'Pause after each task group').props.checked, true)
+  assert.equal(controlLabelled(switches, 'Stop at each task group boundary').props.checked, true)
   assert.equal(controlLabelled(switches, 'Compact inside a task').props.checked, true)
   assert.equal(controlLabelled(switches, 'Protocol section').props.checked, true)
 
@@ -382,7 +382,7 @@ test('each control writes its own field, with no Save button in between', async 
   controlLabelled(switchesOf(nodes), 'Commit openspec files').props.onChange(true)
   controlLabelled(segmentsOf(nodes), 'Commit tool').props.onChange('git')
   controlLabelled(switchesOf(nodes), 'Code review after each task group').props.onChange(true)
-  controlLabelled(switchesOf(nodes), 'Pause after each task group').props.onChange(false)
+  controlLabelled(switchesOf(nodes), 'Stop at each task group boundary').props.onChange(false)
   controlLabelled(switchesOf(nodes), 'Compact inside a task').props.onChange(false)
   controlLabelled(segmentsOf(nodes), 'When the compaction budget runs out').props.onChange('break')
   controlLabelled(switchesOf(nodes), 'Protocol section').props.onChange(false)
@@ -393,7 +393,7 @@ test('each control writes its own field, with no Save button in between', async 
     [{ op: 'set', path: ['commit', 'openspec'], value: true }],
     [{ op: 'set', path: ['commit', 'tool'], value: 'git' }],
     [{ op: 'set', path: ['review', 'enabled'], value: true }],
-    [{ op: 'set', path: ['pause', 'enabled'], value: false }],
+    [{ op: 'set', path: ['boundary', 'enabled'], value: false }],
     [{ op: 'set', path: ['compaction', 'midTask'], value: false }],
     [{ op: 'set', path: ['compaction', 'onFailure'], value: 'break' }],
     [{ op: 'set', path: ['protocol', 'systemSection'], value: false }],
@@ -471,7 +471,7 @@ test('a refused retry number goes back to the snapshot value and says so', async
   )
 })
 
-test('the switches sit in the order the design fixes, and the pause row writes pause.enabled', async () => {
+test('the switches sit in the order the design fixes, and the boundary row writes boundary.enabled', async () => {
   const form = createForm({ status: 'ready', writable: true, value: VALUE })
   const page = mount(form)
 
@@ -480,7 +480,7 @@ test('the switches sit in the order the design fixes, and the pause row writes p
     'Commit after each task group',
     'Commit openspec files',
     'Code review after each task group',
-    'Pause after each task group',
+    'Stop at each task group boundary',
     'Compact inside a task',
     'Protocol section',
   ], 'the openspec switch follows the commit switch, and the protocol section sits next to compaction inside a task (D6)')
@@ -492,14 +492,14 @@ test('the switches sit in the order the design fixes, and the pause row writes p
     'the openspec switch shows commit.openspec',
   )
 
-  controlLabelled(switchesOf(page.render()), 'Pause after each task group').props.onChange(false)
+  controlLabelled(switchesOf(page.render()), 'Stop at each task group boundary').props.onChange(false)
   await settle()
   assert.deepEqual(form.writes, [
-    [{ op: 'set', path: ['pause', 'enabled'], value: false }],
-  ], 'the pause switch writes pause.enabled and nothing else')
+    [{ op: 'set', path: ['boundary', 'enabled'], value: false }],
+  ], 'the boundary switch writes boundary.enabled and nothing else')
 
-  form.set({ value: { ...VALUE, pause: { enabled: false } } })
-  const after = controlLabelled(switchesOf(page.render()), 'Pause after each task group')
+  form.set({ value: { ...VALUE, boundary: { enabled: false } } })
+  const after = controlLabelled(switchesOf(page.render()), 'Stop at each task group boundary')
   assert.equal(after.props.checked, false, 'a value changed elsewhere reaches this row without a reload')
 })
 
