@@ -27,6 +27,7 @@ import {
 } from '../lib/explore.js'
 import { MIN_OPENSPEC_VERSION, OpenSpecCli } from '../lib/openspec.js'
 import { PROTOCOL_SECTION } from '../lib/protocol.js'
+import { createRuns } from '../lib/runs.js'
 
 const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'listing')
 const applyFixturesDir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'apply')
@@ -218,6 +219,8 @@ function recordingPrompt() {
  *   text and, for GitButler, the branch (5.2, 7.3).
  * @param {Function} [options.forgetCommitText] - dropping the stored text of a finished change (5.3).
  * @param {Function} [options.cancelTurn] - the session turn a pause or a stop ends (5.2).
+ * @param {object} [options.runs] - the run slot the control should use instead of creating
+ *   one (7.3): the mount passes the slot its routes read, so both surfaces see one run.
  * @returns {{control: object, asked: object[], descriptions: object[], messages: object[], approvals: string[], cancellations: string[], agent: object, forgotten: object[]}}
  *   the control, the initialisation questions, the description questions, the
  *   follow-up messages, the sessions whose approvals were narrowed, the sessions whose
@@ -240,6 +243,7 @@ function harness({
   forgetCommitText,
   appendNotice,
   cancelTurn,
+  runs,
 }) {
   const asked = []
   const descriptions = []
@@ -258,6 +262,7 @@ function harness({
   const control = createControl({
     config: resolveConfig(config),
     createCli,
+    runs,
     cwdOf: () => CWD,
     askInit: async (invocation, cwd) => {
       asked.push({ invocation, cwd })
@@ -2654,6 +2659,38 @@ test('`/taskloop pause` parks the active run and leaves the slot taken', async (
   assert.equal(messages.length, 1)
   // Neither the pause nor the stop of a parked run read a task file.
   assert.equal(cli.calls.length, 2)
+})
+
+test('a control built around a passed slot acts on the run that slot holds', async () => {
+  const runs = createRuns()
+  const { run } = runs.start('add-a', { cwd: CWD })
+  const { control } = harness({ runs })
+
+  // No CLI and no invocation: the report reads the slot, and the slot is the deployment's
+  // own — the one the HTTP surface is handed (7.3). A control that had made its own slot
+  // would answer "no run is active" here while the badge showed one.
+  assert.equal(
+    control.status().text,
+    'taskloop: a run for change "add-a" is active; no task has been sent yet.',
+  )
+
+  run.pause()
+  assert.match(control.status().text, /the run for change "add-a" is paused/)
+
+  // The other direction of the same sharing: a resume through the command releases the
+  // gate the slot's own `pause()` closed.
+  await control.resume()
+  assert.equal(run.paused, false)
+  assert.equal(runs.current(), run, 'the slot still holds the same run')
+})
+
+test('a passed slot without the three slot methods is refused at build time', () => {
+  // A mount that passes a half-built slot is a composition mistake; failing at the mount
+  // names it, instead of a `/taskloop` that throws per invocation (task 7.3).
+  assert.throws(
+    () => harness({ runs: { current: () => null } }),
+    /createControl requires runs\.start/,
+  )
 })
 
 test('a pause ends the turn of the session the run leads', async () => {
