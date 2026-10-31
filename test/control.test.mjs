@@ -2575,6 +2575,155 @@ test('stop and status answer that no run is active when nothing was started', as
   assert.deepEqual(control.status(), { kind: 'success', text: 'taskloop: no run is active.' })
 })
 
+test('pause and resume answer that there is nothing to park or release', async () => {
+  const { control } = harness({ createCli: () => ({}) })
+
+  assert.deepEqual(await control.pause(), { kind: 'success', text: 'taskloop: no run is active.' })
+  assert.deepEqual(await control.resume(), {
+    kind: 'success',
+    text: 'taskloop: no run is active; nothing was resumed.',
+  })
+})
+
+test('`/taskloop pause` parks the active run and leaves the slot taken', async () => {
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+  ])
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    // The turn never ends on its own, so the run stays live until the stop below.
+    agent: { whenIdle: () => new Promise(() => {}) },
+  })
+
+  const running = control.run(invocation(agent), { change: null })
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const parked = await control.pause()
+  assert.equal(parked.kind, 'success')
+  // The report names the task the run stopped at and the command that releases it: a
+  // park without either is a run the user cannot place or continue (task 4.3).
+  assert.match(
+    parked.text,
+    /^taskloop: parked the run for change "add-taskloop-plugin" \(on task 2\.3\); it stays paused until \/taskloop resume\./,
+  )
+
+  // A second pause changes nothing and says so (spec "Повторная пауза"), and the slot
+  // still holds the run: a pause does not end the work, so the next `/taskloop` is refused.
+  const again = await control.pause()
+  assert.match(
+    again.text,
+    /the run for change "add-taskloop-plugin" is already paused \(on task 2\.3\); nothing was changed/,
+  )
+  // A parked run is a run that still owns the slot, so `/taskloop status` reports the
+  // pause on the task it stopped at and names the command that continues it (task 4.3).
+  const status = control.status().text
+  assert.match(status, /the run for change "add-taskloop-plugin" is paused \(on task 2\.3\)/)
+  assert.match(status, /\/taskloop resume continues it/)
+  // And a second `/taskloop` meets that same slot: refused, with the command that
+  // releases the parked run instead of an explanation of a run that is not moving
+  // (spec "Запуск во время паузы").
+  const otherMessages = []
+  const refusal = await control.run(
+    invocation({ id: 'agent-2', followup: (message) => otherMessages.push(message), async whenIdle() {} }),
+    { change: null },
+  )
+  assert.equal(refusal.kind, 'error')
+  assert.match(
+    refusal.text,
+    /^taskloop: a run for change "add-taskloop-plugin" is paused \(on task 2\.3\); \/taskloop resume continues it, and no second run was started\./,
+  )
+  assert.equal(otherMessages.length, 0)
+
+  const stopped = await control.stop()
+  const result = await running
+
+  assert.match(stopped.text, /^taskloop: stopped the run for change "add-taskloop-plugin" on task 2\.3/)
+  assert.equal(result.kind, 'success')
+  assert.equal(messages.length, 1)
+  // Neither the pause nor the stop of a parked run read a task file.
+  assert.equal(cli.calls.length, 2)
+})
+
+test('`/taskloop resume` releases a parked run and re-sends the task the pause interrupted', async () => {
+  // After the resume the file still shows 2.3 unchecked, because the pause cancelled its
+  // turn: that box is the user's cancellation, so the same task goes out again instead of
+  // ending the run as a failure (design D6).
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(applyFixture('ready.json')),
+  ])
+  let release
+  const turn = new Promise((resolve) => {
+    release = resolve
+  })
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    agent: { whenIdle: () => turn },
+  })
+
+  const running = control.run(invocation(agent), { change: null })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(messages.length, 1)
+
+  const parked = await control.pause()
+  assert.match(parked.text, /parked the run for change "add-taskloop-plugin" \(on task 2\.3\)/)
+  // The turn ends, so the run reaches its gate and parks there: the parked run reads
+  // nothing, which is why the CLI count stays at the listing and the one read.
+  release()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(cli.calls.length, 2, 'a parked run reads no task file')
+
+  const resumed = await control.resume()
+  assert.equal(resumed.kind, 'success')
+  // The resume names the task that goes out again, which is the one the pause stopped:
+  // without it the user cannot tell a resumed run from a run that never stopped, and the
+  // re-sent task below would be the only evidence (task 4.3).
+  assert.match(
+    resumed.text,
+    /^taskloop: resumed the run for change "add-taskloop-plugin"; the run re-reads tasks\.md and re-sends task 2\.3 unless it is now checked\./,
+  )
+
+  const result = await running
+
+  // The re-sent task is the same one, and the run goes on with it instead of stopping
+  // the moment the resume released the gate.
+  assert.equal(messages.length, 2)
+  assert.match(messages[1].content[0].text, /выполни task 2\.3/u)
+  assert.match(result.text, /sent tasks 2\.3 and 2\.3/)
+  assert.match(result.text, /still leaves 2\.3 unchecked/)
+  assert.equal(cli.calls.length, 4)
+})
+
+test('`/taskloop resume` refuses when the run is still working', async () => {
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+  ])
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    agent: { whenIdle: () => new Promise(() => {}) },
+  })
+
+  const running = control.run(invocation(agent), { change: null })
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const refused = await control.resume()
+
+  assert.equal(refused.kind, 'success')
+  assert.match(
+    refused.text,
+    /^taskloop: no run is parked: the run for change "add-taskloop-plugin" is still working; nothing was resumed\./,
+  )
+  // The refusal touched nothing: the run kept its task and the slot.
+  assert.match(control.status().text, /is active on task 2\.3/)
+  await control.stop()
+  await running
+  assert.equal(messages.length, 1)
+})
+
 test('a transient compaction failure is retried under the configured policy', async () => {
   const cli = scriptedCli([
     cliResult(fixture('repo.json')),

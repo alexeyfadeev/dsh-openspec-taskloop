@@ -72,6 +72,8 @@ function fakeControl(result = { kind: 'success' }) {
       stop: action(ACTION.stop),
       status: action(ACTION.status),
       explore: action(ACTION.explore),
+      pause: action(ACTION.pause),
+      resume: action(ACTION.resume),
     },
     calls,
     result,
@@ -103,6 +105,19 @@ test('stop, status and explore are subcommands, not change names', () => {
   assert.deepEqual(parseTaskloopArgs('  explore\n'), { kind: ACTION.explore })
 })
 
+test('pause and resume are subcommands that shadow changes of the same name', () => {
+  // The two forms the pause feature adds: the whole argument being the word makes it
+  // a subcommand, so a change that happens to be called `pause` or `resume` cannot be
+  // started through that spelling — the same trade-off `explore` records (design D19).
+  assert.deepEqual(parseTaskloopArgs('pause'), { kind: ACTION.pause })
+  assert.deepEqual(parseTaskloopArgs('  pause  '), { kind: ACTION.pause })
+  assert.deepEqual(parseTaskloopArgs('resume'), { kind: ACTION.resume })
+  assert.deepEqual(parseTaskloopArgs('\tresume\n'), { kind: ACTION.resume })
+  for (const name of ['pause', 'resume']) {
+    assert.notDeepEqual(parseTaskloopArgs(name), { kind: ACTION.run, change: name })
+  }
+})
+
 test('matches subcommands exactly, so their uppercase spellings stay change names', () => {
   // OpenSpec change names are lowercase, so no real change is shadowed by this;
   // an uppercase subcommand reaching the bootstrap fails there as an unknown
@@ -110,10 +125,14 @@ test('matches subcommands exactly, so their uppercase spellings stay change name
   assert.deepEqual(parseTaskloopArgs('STOP'), { kind: ACTION.run, change: 'STOP' })
   assert.deepEqual(parseTaskloopArgs('Status'), { kind: ACTION.run, change: 'Status' })
   assert.deepEqual(parseTaskloopArgs('Explore'), { kind: ACTION.run, change: 'Explore' })
+  assert.deepEqual(parseTaskloopArgs('Pause'), { kind: ACTION.run, change: 'Pause' })
+  assert.deepEqual(parseTaskloopArgs('Resume'), { kind: ACTION.run, change: 'Resume' })
 })
 
 test('more than one argument is a usage error naming the count', () => {
-  for (const rawInput of ['stop now', 'status extra', 'explore now', 'a b', '  add-auth  please ']) {
+  for (const rawInput of [
+    'stop now', 'status extra', 'explore now', 'pause now', 'resume now', 'a b', '  add-auth  please ',
+  ]) {
     const parsed = parseTaskloopArgs(rawInput)
     assert.equal(parsed.kind, 'invalid')
     assert.match(parsed.reason, /at most one argument/)
@@ -141,9 +160,11 @@ test('registers the command with its metadata and no attachments', () => {
   assert.equal(typeof definition.handler, 'function')
 })
 
-test('refuses to register without all four actions', () => {
+test('refuses to register without all six actions', () => {
   const { ctx } = fakeContext()
-  for (const missing of [ACTION.run, ACTION.stop, ACTION.status, ACTION.explore]) {
+  for (const missing of [
+    ACTION.run, ACTION.stop, ACTION.status, ACTION.explore, ACTION.pause, ACTION.resume,
+  ]) {
     const { control } = fakeControl()
     delete control[missing]
     assert.throws(() => registerTaskloopCommand(ctx, control), new RegExp(`control\\.${missing}`))
@@ -220,9 +241,34 @@ test('an explore request reaches only the explore action', () => {
   assert.equal(calls[0].length, 2, 'explore takes no action options')
 })
 
-test('the usage text names the explore form', () => {
-  assert.match(USAGE, /\/taskloop explore/)
-  assert.match(COMMAND.hint, /explore/)
+test('pause and resume reach their own actions and nothing else', () => {
+  const { ctx, registrations } = fakeContext()
+  const { control, calls, result } = fakeControl()
+  registerTaskloopCommand(ctx, control)
+  const [{ handler }] = registrations
+
+  const pauseInvocation = invocation('pause')
+  const resumeInvocation = invocation(' resume ')
+  assert.equal(handler(pauseInvocation), result)
+  assert.equal(handler(resumeInvocation), result)
+
+  assert.deepEqual(calls.map((call) => call[0]), [ACTION.pause, ACTION.resume])
+  assert.equal(calls[0][1], pauseInvocation)
+  assert.equal(calls[1][1], resumeInvocation)
+  // Neither form takes the action options a run takes: a pause and a resume name no
+  // change, and passing one would be a second way to start a run.
+  assert.equal(calls[0].length, 2)
+  assert.equal(calls[1].length, 2)
+})
+
+test('the usage text names every form the command accepts', () => {
+  assert.equal(USAGE.split('\n').length, 6, 'one line per form')
+  for (const form of ['[change]', 'stop', 'status', 'explore', 'pause', 'resume']) {
+    const escaped = form.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+    assert.match(USAGE, new RegExp(`/taskloop ${escaped}(?:$| -)`, 'mu'))
+  }
+  assert.match(COMMAND.hint, /pause/)
+  assert.match(COMMAND.hint, /resume/)
 })
 
 test('apply mounts the command through an effect', () => {
@@ -245,9 +291,12 @@ test('the mounted command answers usage errors and reports that no run is active
   assert.equal(invalid.kind, 'error')
   assert.ok(invalid.text.includes(USAGE))
 
-  // Mounting registers the command but starts nothing, so both control forms answer
-  // without inventing a run. `stop` answers asynchronously: it waits for the run it
-  // ended to return before it reports where that run was.
+  // Mounting registers the command but starts nothing, so all four control forms
+  // answer without inventing a run. `stop` answers asynchronously: it waits for the
+  // run it ended to return before it reports where that run was.
   assert.match((await handler(invocation('stop'))).text, /no run is active/)
   assert.match((await handler(invocation('status'))).text, /no run is active/)
+  // A pause and a resume without a run report the absence and start nothing.
+  assert.match((await handler(invocation('pause'))).text, /no run is active/)
+  assert.match((await handler(invocation('resume'))).text, /no run is active/)
 })
