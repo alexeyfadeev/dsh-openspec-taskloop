@@ -27,6 +27,14 @@
 // backend keeps failing with `summary`, the shipped schedule of 40, 60 and 90 seconds
 // is waited in full — through an injected clock, so the test does not pay for it —
 // and `break` withholds the second task of the open group instead of sending it.
+//
+// The third scenario is the pause (9.1, design D1/D2/D4/D6): the run sends its first
+// task, `/taskloop pause` ends that turn through the session service and parks the loop
+// before it reads again, the slot stays taken, `/taskloop resume` re-sends the same
+// task because the box the pause left unchecked is not a failure, and `/taskloop stop`
+// ends the run the second pause parked. The turn is a real one here — the fake model
+// ends it only when it is cancelled or when the test lets it finish — so the test can
+// tell a cancelled turn from a completed one by the checkbox alone.
 
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -39,7 +47,9 @@ import { COMMIT_MESSAGE_QUESTION_ID } from '../lib/commit-text.js'
 import { resolveConfig } from '../lib/config.js'
 import { createControl } from '../lib/control.js'
 import { createEnvironment } from '../lib/environment.js'
+import { createRuns } from '../lib/runs.js'
 import { readCommitMessage, stateFileOf, stateKeyOf } from '../lib/state.js'
+import { statusOf } from '../lib/status.js'
 
 /** Directory the run works in; the fake host answers for it and nothing is written there. */
 const CWD = 'C:\\projects\\demo'
@@ -563,4 +573,267 @@ test('four failed compactions wait the default schedule and break holds back the
   assert.doesNotMatch(result.text, /Warning:/)
   // The turn of 2.3 is all that happened: no second task message was composed.
   assert.equal(events.filter((event) => event.startsWith('task ')).length, 1)
+})
+
+/**
+ * The model of the third scenario: a turn that ends only when it is told to.
+ *
+ * A pause ends a turn through the session service rather than by itself (design D4), so
+ * the fake model has to be a turn the test can end from outside. `cancel()` is that
+ * ending: the turn stops and nothing is ticked. `finish()` is the model doing its work:
+ * the box of the task it was sent is ticked and the turn ends. Nothing else about the
+ * run is the model's business — the loop re-reads the file and decides (design D4).
+ *
+ * @param {object} project - the fake project, see {@link createProject}.
+ * @param {string[]} events - shared ordering log.
+ * @returns {object} the agent, the tasks it was sent, and the two ways a turn ends.
+ */
+function createTurnModel(project, events) {
+  /** @type {string[]} */
+  const sent = []
+  /** @type {{label: string, idle: Promise<void>, finish: () => void}|undefined} */
+  let turn
+
+  const agent = {
+    id: 'agent-1',
+    // The run starts in the session its command came from (design D7), and the pause
+    // addresses that session rather than the agent (design D4).
+    sessionId: 'session-1',
+    session: { header: { cwd: CWD }, append() {} },
+    followup(message) {
+      const label = /выполни task (\d+\.\d+), далее/u.exec(message.content[0].text)?.[1]
+      if (label === undefined) {
+        throw new Error(`the run sent a message the fake model cannot act on: ${message.content[0].text}`)
+      }
+      sent.push(label)
+      events.push(`task ${label} in session-1`)
+      let finish
+      const idle = new Promise((resolve) => {
+        finish = resolve
+      })
+      turn = { label, idle, finish }
+    },
+    whenIdle() {
+      return turn.idle
+    },
+  }
+
+  return {
+    agent,
+    sent,
+    /** The model works and is done: the task it was sent is ticked and the turn ends. */
+    finish() {
+      project.tick(turn.label)
+      turn.finish()
+    },
+    /** The session service ends the turn: the task is left exactly as it was. */
+    cancel() {
+      turn.finish()
+    },
+  }
+}
+
+/**
+ * Wait until the run reaches a state the test can act on.
+ *
+ * The run is a chain of turns and CLI answers, so the test can only observe it between
+ * two ticks of the event loop. This turns "the message left" and "the run parked" into
+ * conditions instead of a fixed number of `setImmediate` calls, which is what keeps the
+ * scenario from depending on the order in which those promises happen to settle.
+ *
+ * @param {() => boolean} predicate - condition to wait for.
+ * @param {string} message - what to report when it never becomes true.
+ * @returns {Promise<void>} resolves once the condition holds.
+ * @throws {assert.AssertionError} when it never does.
+ */
+async function until(predicate, message) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    if (predicate()) return
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  assert.fail(message)
+}
+
+/**
+ * How many times the fake CLI was asked for the task file of the run.
+ *
+ * The count is what makes "a parked run reads nothing" observable: the loop reads the
+ * file once per decision, and a pause that still cost a read would show up here even
+ * when no message followed it.
+ *
+ * @param {object} subprocess - the fake subprocess service, see {@link createSubprocess}.
+ * @returns {number} the number of `openspec instructions apply` calls.
+ */
+const instructionReads = (subprocess) =>
+  subprocess.spawned.filter((spec) => spec.argv[1] === 'instructions').length
+
+test('a pause cancels the turn and parks the run, and resume and stop end it from there', async () => {
+  // The scenario of the UI change, end to end (design D1/D2/D4/D6, spec "Пауза прогона",
+  // "Возобновление прогона"): a run that starts, is paused in the middle of its first
+  // turn, keeps the slot while it waits, re-sends the same task after a resume, and is
+  // ended by a stop while the second pause holds it. The review and the commit are off
+  // because the scenario stops inside the first group: a boundary would open a session
+  // and that is another change's subject.
+  const events = []
+  const project = createProject()
+  const subprocess = createSubprocess(project, events)
+  const model = createTurnModel(project, events)
+  /** Sessions whose turn the pause or the stop asked to end, in order (design D4). */
+  const cancelled = []
+
+  const services = {
+    subprocess,
+    // The service the composer's stop button uses: a pause and a stop end the turn
+    // through it, by session id, and it is what makes the cancelled turn a turn that
+    // really ended rather than a wait the test abandoned. It resolves the agent of a
+    // session the way the host does, which is how the between-task compaction finds the
+    // agent to shrink.
+    sessionController: {
+      async cancel(request) {
+        cancelled.push(request.sessionId)
+        events.push(`cancel ${request.sessionId}`)
+        model.cancel()
+      },
+      async resolveAgent(sessionId) {
+        return sessionId === model.agent.sessionId ? model.agent : undefined
+      },
+    },
+    // A compaction service that answers: a task that continues its group is compacted
+    // before it is sent (6.1), so a deployment of this scenario has one. Nothing is
+    // asserted about it beyond its place in the order.
+    compaction: {
+      async compactNow(agent) {
+        events.push(`compact ${agent.id}`)
+      },
+    },
+    workingDirectory: { get: () => CWD },
+  }
+  const ctx = { get: (name) => services[name], logger: { warn() {} } }
+  const config = resolveConfig({ review: { enabled: false }, commit: { enabled: false } })
+  // The slot is the deployment's own, so the test reads the same one the commands and a
+  // badge would read (7.3); `statusOf` is the badge's own view of it (6.1).
+  const runs = createRuns()
+  const control = createControl({ config, ...createEnvironment(ctx, config), runs })
+
+  const running = control.run(
+    { commandId: 'command-1', agent: model.agent, rawInput: '', attachments: [], signal: new AbortController().signal },
+    { change: null },
+  )
+
+  // The run starts: one message for the first unchecked task, and its turn is in flight.
+  await until(() => model.sent.length === 1, 'the run did not send its first task')
+  assert.deepEqual(model.sent, ['2.3'])
+
+  // The pause ends that turn through the session service and parks the loop: the gate
+  // closes before the service is asked, so nothing new can leave while it is asked.
+  const parked = await control.pause()
+  assert.match(
+    parked.text,
+    /^taskloop: parked the run for change "add-taskloop-plugin" \(on task 2\.3\); it stays paused until \/taskloop resume\./u,
+  )
+  assert.deepEqual(cancelled, ['session-1'], 'the pause ended the turn of the session the run leads')
+  await until(() => statusOf(runs).phase === 'paused', 'the run did not park after the pause')
+
+  // The slot stays taken while the run waits (design D1): the snapshot says the run is
+  // active and paused, on the task it stopped at, in the session it leads, with the
+  // progress of the last reading — and a parked run sends nothing.
+  const snapshot = statusOf(runs)
+  assert.equal(snapshot.active, true)
+  assert.equal(snapshot.change, CHANGE)
+  assert.equal(snapshot.cwd, CWD)
+  assert.equal(snapshot.sessionId, 'session-1')
+  assert.equal(snapshot.task.description, TASKS[0].description)
+  assert.deepEqual(snapshot.progress, { complete: 0, total: TASKS.length })
+  assert.equal(model.sent.length, 1, 'a parked run sends nothing')
+
+  // A second `/taskloop` meets the parked run and offers the command that releases it,
+  // instead of a refusal that would leave the user guessing why the run is not moving.
+  const otherMessages = []
+  const refusal = await control.run(
+    {
+      commandId: 'command-2',
+      agent: {
+        id: 'agent-2',
+        sessionId: 'session-2',
+        followup: (message) => otherMessages.push(message),
+        async whenIdle() {},
+      },
+      rawInput: '',
+      attachments: [],
+      signal: new AbortController().signal,
+    },
+    { change: null },
+  )
+  assert.equal(refusal.kind, 'error')
+  assert.match(
+    refusal.text,
+    /^taskloop: a run for change "add-taskloop-plugin" is paused \(on task 2\.3\); \/taskloop resume continues it, and no second run was started\./u,
+  )
+  assert.equal(otherMessages.length, 0)
+  // A parked run reads no task file: the one read was the one that chose 2.3.
+  assert.equal(instructionReads(subprocess), 1)
+
+  // The resume re-reads `tasks.md` and finds 2.3 unchecked — the box the pause left
+  // that way — so the same task goes out again instead of the run ending as a failure
+  // (design D6). The reading is the run's own, and the allowance is spent by it.
+  const resumed = await control.resume()
+  assert.match(
+    resumed.text,
+    /^taskloop: resumed the run for change "add-taskloop-plugin"; the run re-reads tasks\.md and re-sends task 2\.3 unless it is now checked\./u,
+  )
+  await until(() => model.sent.length === 2, 'the resumed run did not re-send the task')
+  assert.deepEqual(model.sent, ['2.3', '2.3'])
+  assert.equal(statusOf(runs).phase, 'running')
+  assert.equal(instructionReads(subprocess), 2)
+
+  // The re-sent turn now does its work, and the run moves on to the next task of the group.
+  model.finish()
+  await until(() => model.sent.length === 3, 'the run did not continue after the re-sent task')
+  assert.equal(model.sent[2], '2.4')
+
+  // The second pause parks the run again, and this time a stop ends it: a parked run is
+  // released by the stop rather than left waiting for a resume nobody will send (design D2).
+  const parkedAgain = await control.pause()
+  assert.match(parkedAgain.text, /parked the run for change "add-taskloop-plugin" \(on task 2\.4\)/u)
+  await until(() => statusOf(runs).phase === 'paused', 'the run did not park the second time')
+
+  const stopped = await control.stop()
+  const result = await running
+
+  // The stop names the task the parked run was on and how many turns left the session —
+  // the re-sent task counts as one of them — and it frees the slot for the next run.
+  assert.match(
+    stopped.text,
+    /^taskloop: stopped the run for change "add-taskloop-plugin" on task 2\.4 \(3 tasks sent\)/u,
+  )
+  assert.equal(runs.current(), null)
+  assert.deepEqual(statusOf(runs), { active: false })
+  assert.equal(model.sent.length, 3, 'the parked run sent nothing while it was stopped')
+
+  // The report of the stopped run: what left the session, the ending, and the progress
+  // of the last reading rather than the listing's stale counts.
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /^taskloop: OpenSpec root: C:\\projects\\demo\./u)
+  assert.match(result.text, /Change "add-taskloop-plugin" \(1\/4 tasks done\)/u)
+  assert.match(
+    result.text,
+    /sent tasks 2\.3, 2\.3 and 2\.4; the run was stopped by \/taskloop stop after that turn\./u,
+  )
+
+  // The order the sessions and the services saw: the task, the pause that ended its
+  // turn, the compaction of the transition the resume led to, the same task again, the
+  // next one, the second pause, and the stop that freed the slot.
+  assert.deepEqual(events, [
+    'task 2.3 in session-1',
+    'cancel session-1',
+    'compact agent-1',
+    'task 2.3 in session-1',
+    'compact agent-1',
+    'task 2.4 in session-1',
+    'cancel session-1',
+    'cancel session-1',
+  ])
+  assert.deepEqual(cancelled, ['session-1', 'session-1', 'session-1'])
+  // Three decisions, three reads: the first task, the re-sent one, the next one.
+  assert.equal(instructionReads(subprocess), 3)
 })
