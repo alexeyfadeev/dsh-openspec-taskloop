@@ -9,6 +9,11 @@
 // kept and dropped again, and which argv the commit tool is started with (4.2). A
 // fake context exposes exactly the services the seam reads, so a lookup of the
 // wrong service fails here instead of in a mounted profile.
+//
+// The session controller ends a turn as well (5.1, design D4 of the UI change): a pause
+// and a stop ask it to cancel the turn of the session the run leads. That call is
+// best-effort, and both halves are pinned here — the request it receives, and the log
+// line a refusal leaves behind, with the pause it did not undo.
 
 import assert from 'node:assert/strict'
 import { access, mkdir, mkdtemp, rm } from 'node:fs/promises'
@@ -30,18 +35,25 @@ import {
   buildExplorePrompt,
 } from '../lib/explore.js'
 import { OpenSpecCli } from '../lib/openspec.js'
+import { createRuns } from '../lib/runs.js'
 import { readCommitMessage, stateFileOf, writeCommitMessage } from '../lib/state.js'
 
 /**
  * A context that hands back the composed services and nothing else.
  *
  * @param {object} services - service name to instance.
+ * @param {string[]} [warnings] - collects the lines the seam writes to the logger.
  * @returns {object} fake plugin context.
  */
-function fakeCtx(services) {
+function fakeCtx(services, warnings) {
   return {
     get: (name) => services[name],
-    logger: { info() {} },
+    logger: {
+      info() {},
+      warn(line) {
+        warnings?.push(line)
+      },
+    },
   }
 }
 
@@ -321,6 +333,80 @@ test('a deployment without a session controller cannot open a session', async ()
     () => environment.openSession({ agent: agentWith(), signal: undefined }, { change: 'add-taskloop-plugin', cwd: '/work/demo' }),
     /sessionController service is not composed/,
   )
+})
+
+test('the turn of a session is cancelled through the session controller', async () => {
+  const calls = []
+  const environment = createEnvironment(fakeCtx({
+    sessionController: {
+      async cancel(request) {
+        calls.push(request)
+        return { cancelled: true }
+      },
+    },
+  }), resolveConfig())
+
+  assert.equal(await environment.cancelTurn('session-2'), true)
+  // Addressed by session, not by agent: the same request the composer's stop button makes
+  // (design D4), so a pause needs no live handle on the agent.
+  assert.deepEqual(calls, [{ sessionId: 'session-2' }])
+})
+
+test('a refused cancellation is logged and leaves the pause in force', async () => {
+  const warnings = []
+  const runs = createRuns()
+  const run = runs.start('add-a', { cwd: '/work/demo', sessionId: 'session-2' }).run
+  const environment = createEnvironment(fakeCtx({
+    sessionController: {
+      async cancel() {
+        throw new Error('session session-2 is not attached to a turn')
+      },
+    },
+  }, warnings), resolveConfig())
+
+  assert.equal(run.pause(), true)
+  assert.equal(await environment.cancelTurn(run.sessionId), false)
+
+  // Best-effort (design D4): what the service said changes nothing about the run. The
+  // pause stands, the run was not stopped behind the user's back, and its own signal —
+  // the only cancellation `/taskloop stop` uses — was not touched either.
+  assert.equal(run.paused, true)
+  assert.equal(run.stopped, false)
+  assert.equal(run.signal.aborted, false)
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /session session-2/u)
+  assert.match(warnings[0], /is not attached to a turn/u)
+
+  // Still releasable: `/taskloop resume` is what ends this pause, not the log line.
+  assert.equal(run.resume(), true)
+  assert.equal(run.paused, false)
+})
+
+test('a deployment without a session controller cannot cancel a turn, and says why', async () => {
+  const warnings = []
+  const environment = createEnvironment(fakeCtx({}, warnings), resolveConfig())
+
+  assert.equal(await environment.cancelTurn('session-2'), false)
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /sessionController service is not composed/u)
+})
+
+test('a run that does not know its session asks the service for nothing', async () => {
+  const calls = []
+  const warnings = []
+  const environment = createEnvironment(fakeCtx({
+    sessionController: {
+      async cancel(request) {
+        calls.push(request)
+      },
+    },
+  }, warnings), resolveConfig())
+
+  assert.equal(await environment.cancelTurn(undefined), false)
+  assert.equal(await environment.cancelTurn(''), false)
+  assert.deepEqual(calls, [])
+  // Nothing was asked, so there is nothing to report either.
+  assert.deepEqual(warnings, [])
 })
 
 test('the review session denies approval prompts on its live agent', async () => {

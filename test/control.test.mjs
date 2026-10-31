@@ -217,10 +217,12 @@ function recordingPrompt() {
  * @param {Function} [options.commitInput] - the input of this change's commits: the message
  *   text and, for GitButler, the branch (5.2, 7.3).
  * @param {Function} [options.forgetCommitText] - dropping the stored text of a finished change (5.3).
- * @returns {{control: object, asked: object[], descriptions: object[], messages: object[], approvals: string[], agent: object, forgotten: object[]}}
+ * @param {Function} [options.cancelTurn] - the session turn a pause or a stop ends (5.2).
+ * @returns {{control: object, asked: object[], descriptions: object[], messages: object[], approvals: string[], cancellations: string[], agent: object, forgotten: object[]}}
  *   the control, the initialisation questions, the description questions, the
- *   follow-up messages, the sessions whose approvals were narrowed, the agent
- *   that received the tasks, and the changes whose stored message was dropped.
+ *   follow-up messages, the sessions whose approvals were narrowed, the sessions whose
+ *   turn a pause or a stop asked to end, the agent that received the tasks, and the
+ *   changes whose stored message was dropped.
  */
 function harness({
   createCli,
@@ -237,11 +239,13 @@ function harness({
   commitInput,
   forgetCommitText,
   appendNotice,
+  cancelTurn,
 }) {
   const asked = []
   const descriptions = []
   const messages = []
   const approvals = []
+  const cancellations = []
   const forgotten = []
   const agent = {
     id: 'agent-1',
@@ -279,12 +283,19 @@ function harness({
     normalizeEol,
     commitInput,
     appendNotice,
+    // Every test gets the seam, so "nothing was cancelled" is a recorded answer rather
+    // than the absence of a dependency (5.2). An answer that is not `true` stands for the
+    // refusals the real seam turns into a log line instead of a throw.
+    cancelTurn: async (sessionId) => {
+      cancellations.push(sessionId)
+      return await cancelTurn?.(sessionId) ?? true
+    },
     forgetCommitText: async (context) => {
       forgotten.push(context)
       await forgetCommitText?.(context)
     },
   })
-  return { control, asked, descriptions, messages, approvals, agent, forgotten }
+  return { control, asked, descriptions, messages, approvals, cancellations, agent, forgotten }
 }
 
 /** An invocation shaped like the registry's. */
@@ -2643,6 +2654,154 @@ test('`/taskloop pause` parks the active run and leaves the slot taken', async (
   assert.equal(messages.length, 1)
   // Neither the pause nor the stop of a parked run read a task file.
   assert.equal(cli.calls.length, 2)
+})
+
+test('a pause ends the turn of the session the run leads', async () => {
+  // Design D4: a parked run whose turn keeps going is a pause in name only, so the
+  // pause asks the session service to end the turn of the task in flight.
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+  ])
+  const { control, messages, agent, cancellations } = harness({
+    createCli: () => cli,
+    agent: { sessionId: 'session-1', whenIdle: () => new Promise(() => {}) },
+  })
+
+  const running = control.run(invocation(agent), { change: null })
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const parked = await control.pause()
+
+  assert.match(parked.text, /parked the run for change "add-taskloop-plugin" \(on task 2\.3\)/)
+  // The session the run leads is the one the turn is ended in, and it is the only one.
+  assert.deepEqual(cancellations, ['session-1'])
+  assert.equal(messages.length, 1, 'the pause sent nothing')
+
+  await control.stop()
+  await running
+  assert.equal(messages.length, 1, 'the parked run sent nothing while it was stopped')
+})
+
+test('a stop ends the turn of the session the run leads', async () => {
+  // The run's signal ends the loop; the turn is the agent's, and only the session
+  // service can end it (5.2, design D4).
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+  ])
+  const { control, messages, agent, cancellations } = harness({
+    createCli: () => cli,
+    // The turn never ends on its own: only the stop can finish the run.
+    agent: { sessionId: 'session-1', whenIdle: () => new Promise(() => {}) },
+  })
+
+  const running = control.run(invocation(agent), { change: null })
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const stopped = await control.stop()
+  await running
+
+  assert.match(stopped.text, /^taskloop: stopped the run for change "add-taskloop-plugin" on task 2\.3/)
+  assert.deepEqual(cancellations, ['session-1'])
+  assert.equal(messages.length, 1)
+})
+
+test('a pause that lands while a group is being reviewed ends no turn', async () => {
+  // Design D5: the review and the commit of a finished group are not cut short, because a
+  // review whose turn was cancelled reports as one that ran. The pause parks the run after
+  // the hook instead, on the task the next `/taskloop` would continue from.
+  const both = tickedApply([12, 13])
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+    cliResult(both),
+  ])
+  let releaseReview
+  const reviewTurn = new Promise((resolve) => {
+    releaseReview = resolve
+  })
+  const { control, messages, agent, cancellations } = harness({
+    createCli: () => cli,
+    agent: { sessionId: 'session-1' },
+    openSession: async (invocation, context) => ({
+      sessionId: context.range === undefined ? 'session-2' : 'review-1',
+      followup() {},
+      whenIdle: () => reviewTurn,
+    }),
+  })
+
+  const running = control.run(invocation(agent), { change: null })
+  await new Promise((resolve) => setImmediate(resolve))
+  // `tasks.md` is read with both tasks of group 2 checked, so 2.3 and 2.4 had their turns
+  // and the review of the closed group is the turn in flight when the pause arrives: the run
+  // is in the `boundary` phase, not driving a task.
+  assert.equal(messages.length, 2)
+
+  const parked = await control.pause()
+
+  assert.match(parked.text, /parked the run for change "add-taskloop-plugin" \(on task 2\.4\)/)
+  // No turn was ended for the review: a cancelled review would read as a review that ran,
+  // and the commit would follow it as if the group had been checked (design D5).
+  assert.deepEqual(cancellations, [])
+
+  releaseReview()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // The boundary closed — the review ran to its end, the commit was skipped for lack of a
+  // message — and the gate then parked the run before the next task was chosen.
+  assert.match(control.status().text, /is paused \(on task 2\.4\)/)
+  assert.equal(messages.length, 2, 'the next group opened no message')
+  assert.equal(cli.calls.length, 4, 'the parked run read nothing after the boundary')
+
+  await control.stop()
+  await running
+})
+
+test('a pause that lands during the between-task compaction lets it finish and ends no turn', async () => {
+  // The session service aborts the agent's maintenance task together with its turn, so a
+  // pause that asked it during a compaction would end the wait the pause is documented to
+  // let finish (design D4, "Risks") — and the run would stop as a compaction failure
+  // instead of parking. The pause is taken from inside the compaction to pin that moment.
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(progressedApply()),
+  ])
+  let parked
+  const harnessed = harness({
+    createCli: () => cli,
+    compactNow: async () => {
+      parked = harnessed.control.pause()
+      await parked
+      return null
+    },
+  })
+  const { control, messages, agent, cancellations } = harnessed
+
+  const running = control.run(invocation(agent), { change: null })
+  for (let attempt = 0; attempt < 50 && parked === undefined; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+
+  assert.ok(parked !== undefined, 'the run reached the compaction')
+  assert.match(
+    (await parked).text,
+    /parked the run for change "add-taskloop-plugin" \(on task 2\.3\)/,
+  )
+  // No turn was handed to the service: the compaction was still the run's activity, and
+  // cancelling it would have failed the transition instead of parking the run.
+  assert.deepEqual(cancellations, [])
+  await new Promise((resolve) => setImmediate(resolve))
+  // The compaction finished, the gate parked the run before task 2.4 left, and the slot
+  // still holds the parked run.
+  assert.match(control.status().text, /is paused \(on task 2\.3\)/)
+  assert.equal(messages.length, 1)
+  assert.equal(cli.calls.length, 3)
+
+  await control.stop()
+  await running
 })
 
 test('`/taskloop resume` releases a parked run and re-sends the task the pause interrupted', async () => {
