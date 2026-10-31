@@ -1,4 +1,4 @@
-// The Settings page (task 2.2).
+// The client half: the Settings page and the run badge.
 //
 // The page is the plugin's only client code, and it is plain module-loader CJS
 // with no build step: the host serves `lib/client.js` as the package's `/client`
@@ -19,6 +19,22 @@
 // Save button in between — a switch at once, a number on blur or Enter — and —
 // the last test — every row the page renders is named in the README the way the
 // page names it (task 2.4).
+//
+// The badge (task 8.1) is covered the same way: its registration in the session
+// header row, the two phase pills, the empty fragment while no run is reported,
+// and the poll — one request at mount, then one every two seconds, with the
+// interval cleared when the header goes away.
+//
+// The run panel behind the badge (task 8.2) is the same bundle again: the panel
+// opens on the badge's click, reads the task list once per open and again when
+// the run moves to another task, draws the workspace, the bar and the rows with
+// the current task marked, and its buttons post the three actions the commands
+// dispatch to — with the phase the answer carries, not the next poll's.
+//
+// The panel's body states (task 8.3) are the same read seen three ways: the
+// reading note before the answer, the host's own sentence when it refused, and
+// the rows — or a worded empty change — when it answered. Closing the panel
+// returns focus to the badge, which is a `ref` the bundle keeps for that.
 
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -34,6 +50,14 @@ const bundleSource = readFileSync(bundlePath, 'utf8')
 /** The config entry the page edits: the plugin row id in cordis.patch.yml. */
 const CONFIG_ENTRY = 'openspec-taskloop'
 
+/** The three routes the client half reads and writes; they are the contract (design D8). */
+const STATE_URL = '/api/openspec-taskloop/state'
+const TASKS_URL = '/api/openspec-taskloop/tasks'
+const ACTION_URL = '/api/openspec-taskloop/action'
+
+/** Marker the fake React gives a fragment, so the renderer can expand it. */
+const FRAGMENT = Symbol('Fragment')
+
 /** A resolved config block, with every field set away from its default. */
 const VALUE = {
   commit: { enabled: false, openspec: false, tool: 'gitbutler' },
@@ -48,20 +72,50 @@ const VALUE = {
 }
 
 /**
- * A hook runtime over plain objects: `createElement`, `useState`, `useEffect`.
+ * The tracking file both the run and the list report, and the two tasks the
+ * panel tests care about: the run is on the second of the three (task 8.2).
+ */
+const SOURCE = 'C:\\work\\_dsh\\dsh-openspec-taskloop\\openspec\\changes\\add-pause-resume-ui\\tasks.md'
+
+/** The `/state` answer of a run that is working on line 46. */
+const RUN = {
+  active: true,
+  phase: 'running',
+  change: 'add-pause-resume-ui',
+  cwd: 'C:\\work\\_dsh\\dsh-openspec-taskloop',
+  task: { id: '21', description: '8.2 Собрать диалог', done: false, sourcePath: SOURCE, line: 46 },
+  progress: { complete: 19, total: 24 },
+  sessionId: 'session-1',
+}
+
+/** The `/tasks` answer: one CLI reading, ahead of the poll's counts. */
+const TASKS = {
+  change: 'add-pause-resume-ui',
+  state: 'ready',
+  progress: { total: 24, complete: 20, remaining: 4 },
+  tasks: [
+    { id: '1', description: '8.1 Зарегистрировать бейдж', done: true, sourcePath: SOURCE, line: 45 },
+    { id: '2', description: '8.2 Собрать диалог', done: false, sourcePath: SOURCE, line: 46 },
+    { id: '3', description: '8.3 Покрыть состояния тела', done: false, sourcePath: SOURCE, line: 47 },
+  ],
+}
+
+/**
+ * A hook runtime over plain objects: `createElement`, `useState`, `useEffect`, `useRef`.
  *
- * Effects run once, after the first render — the page subscribes with an empty
- * dependency list, and re-subscribing on every state change would only pile up
- * listeners the real React would have dropped.
+ * Effects follow React's rule, which the badge and the panel depend on: the ones
+ * whose dependency list changed run after the tree is known, the rest do not. A
+ * dependency list is optional, and an effect without one runs on every render.
+ * Cleanups run when the effect re-runs, and `dispose()` runs whatever is left.
+ * `useRef` is a box whose `current` outlives renders, which is what the badge's
+ * ref to its own button is.
  *
  * @returns {object} the fake React, a renderer, and a disposer.
  */
 function createHooks() {
-  const states = []
-  const cleanups = []
+  const hooks = []
+  const pending = []
   let cursor = 0
-  let queued = []
-  let mounted = false
 
   const createElement = (type, props, ...children) => {
     const element = { type, props: { ...(props ?? {}) } }
@@ -70,16 +124,42 @@ function createHooks() {
     return element
   }
 
+  /**
+   * Whether an effect's dependency list is unchanged since its last run.
+   *
+   * @param {unknown[]|undefined} left - deps it last ran with.
+   * @param {unknown[]|undefined} right - deps of this render.
+   * @returns {boolean} true when the effect may be skipped.
+   */
+  const sameDeps = (left, right) => {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false
+    return left.every((value, index) => Object.is(value, right[index]))
+  }
+
   const React = {
     createElement,
+    Fragment: FRAGMENT,
     useState(initial) {
       const at = cursor++
-      if (!(at in states)) states[at] = typeof initial === 'function' ? initial() : initial
-      return [states[at], (next) => { states[at] = typeof next === 'function' ? next(states[at]) : next }]
+      const hook = hooks[at] ?? (hooks[at] = { kind: 'state', ready: false, value: undefined })
+      if (!hook.ready) {
+        hook.value = typeof initial === 'function' ? initial() : initial
+        hook.ready = true
+      }
+      return [hook.value, (next) => { hook.value = typeof next === 'function' ? next(hook.value) : next }]
     },
-    useEffect(effect) {
-      if (mounted) return
-      queued.push(effect)
+    useEffect(effect, deps) {
+      const at = cursor++
+      const hook = hooks[at] ?? (hooks[at] = { kind: 'effect', first: true, deps: undefined, cleanup: undefined })
+      const changed = hook.first === true || !sameDeps(hook.deps, deps)
+      hook.first = false
+      hook.deps = deps
+      if (changed) pending.push({ hook, effect })
+    },
+    useRef(initial) {
+      const at = cursor++
+      const hook = hooks[at] ?? (hooks[at] = { kind: 'ref', box: { current: initial } })
+      return hook.box
     },
   }
 
@@ -88,26 +168,31 @@ function createHooks() {
     /**
      * Render one component and return the host elements it produced.
      *
-     * @param {Function} component - the registered page component.
+     * @param {Function} component - the registered page or badge component.
      * @param {object} props - the props the shell passes.
      * @returns {object[]} every host element, with function components expanded.
      */
     render(component, props) {
       cursor = 0
-      queued = []
       const found = elements(component(props))
-      if (!mounted) {
-        mounted = true
-        for (const effect of queued) {
-          const cleanup = effect()
-          if (typeof cleanup === 'function') cleanups.push(cleanup)
-        }
+      // React runs effects after the tree is committed, which is why the panel's
+      // first render draws no list and the effect that reads one starts here.
+      for (const item of pending.splice(0)) {
+        if (typeof item.hook.cleanup === 'function') item.hook.cleanup()
+        const cleanup = item.effect()
+        item.hook.cleanup = typeof cleanup === 'function' ? cleanup : undefined
       }
       return found
     },
-    /** Release the subscriptions the page's effects opened. */
+    /** Release the subscriptions and timers the effects opened. */
     dispose() {
-      for (const cleanup of cleanups.splice(0)) cleanup()
+      for (const hook of hooks) {
+        if (hook.kind === 'effect' && typeof hook.cleanup === 'function') {
+          hook.cleanup()
+          hook.cleanup = undefined
+        }
+      }
+      pending.length = 0
     },
   }
 }
@@ -126,7 +211,13 @@ function elements(node, found = []) {
     return found
   }
   if (typeof node !== 'object') return found
+  if (node.type === FRAGMENT) return elements(node.props.children, found)
   if (typeof node.type === 'function') return elements(node.type(node.props), found)
+  // A host element stands in for a DOM node in the two ways this bundle uses
+  // one: a `ref` lands on it, and it can be asked for focus, which is what the
+  // badge does when its panel closes (task 8.3).
+  node.focus = () => { node.focused = true }
+  if (typeof node.props.ref === 'object' && node.props.ref !== null) node.props.ref.current = node
   found.push(node)
   return elements(node.props.children, found)
 }
@@ -188,15 +279,28 @@ function createForm(state) {
 /**
  * Load the real bundle the host serves and materialize its factory.
  *
+ * `env` carries the browser globals a contribution may reach for. The Settings
+ * page needs none, so its tests leave it out; the badge polls the host, so its
+ * tests hand over a fake `fetch` and a fake timer table instead of waiting two
+ * seconds per tick.
+ *
  * @param {object} form - the fake config form the page will be given.
+ * @param {object} [env] - browser globals: `fetch`, `setInterval`, `clearInterval`.
  * @returns {object} the bundle exports and the hook runtime.
  */
-function loadBundle(form) {
+function loadBundle(form, env = {}) {
   const hooks = createHooks()
   const primitives = {
     Switch: (props) => hooks.React.createElement('switch', props),
     SegmentedControl: (props) => hooks.React.createElement('segmented', props),
     Input: (props) => hooks.React.createElement('input', props),
+    Button: (props) => hooks.React.createElement('button', props),
+    // The real `Modal` portals its tree into `document.body` and returns nothing
+    // while closed; the fake keeps the same two facts — closed means the children
+    // are never rendered — and drops the portal, which a DOM-less test cannot use.
+    Modal: (props) => (props.open === true
+      ? hooks.React.createElement('modal', props, props.children, props.footer)
+      : null),
   }
   const registrations = []
   const window = { __ModuleLoader__: { load: (registration) => { registrations.push(registration) } } }
@@ -205,8 +309,15 @@ function loadBundle(form) {
     if (specifier === '@deepseek-ai/dsh-client-ui-primitives') return primitives
     throw new Error(`the page required a module outside the platform seed: ${specifier}`)
   }
+  const sandbox = {
+    window,
+    require,
+    fetch: env.fetch ?? (() => Promise.reject(new Error('this test gave the bundle no host'))),
+    setInterval: env.setInterval ?? (() => 0),
+    clearInterval: env.clearInterval ?? (() => {}),
+  }
 
-  runInContext(bundleSource, createContext({ window, require }), { filename: bundlePath })
+  runInContext(bundleSource, createContext(sandbox), { filename: bundlePath })
   assert.equal(registrations.length, 1, 'the bundle registers exactly one factory')
   const [registration] = registrations
   assert.equal(registration.id, 'dsh-openspec-taskloop', 'the factory id is the package name')
@@ -257,20 +368,26 @@ function createCtx(form) {
 }
 
 /**
- * Mount the page the way the loader does, and expose its renderer.
+ * Mount the client half the way the loader does, and expose both contributions.
+ *
+ * `apply` registers two slots — the settings page and the header badge — so the
+ * helper finds each by the slot it fills rather than by registration order.
  *
  * @param {object} form - the fake config form.
- * @returns {object} the mounted page and its bookkeeping.
+ * @param {object} [env] - browser globals for the bundle, see {@link loadBundle}.
+ * @returns {object} the mounted contributions and their bookkeeping.
  */
-function mount(form) {
-  const loaded = loadBundle(form)
+function mount(form, env) {
+  const loaded = loadBundle(form, env)
   const mounted = createCtx(form)
   loaded.exports.apply(mounted.ctx)
-  const [entry] = mounted.registrations
+  const entry = mounted.registrations.find((registration) => registration.options.name === 'settings.section')
+  const badge = mounted.registrations.find((registration) => registration.options.name === 'conversation.session.header.utilities')
   return {
     ...mounted,
     loaded,
     entry,
+    badge,
     form,
     render: () => loaded.hooks.render(entry.component, { close() {} }),
   }
@@ -279,6 +396,135 @@ function mount(form) {
 /** Let the write promises settle. */
 function settle() {
   return new Promise((resolve) => { setImmediate(resolve) })
+}
+
+/**
+ * The badge's renderer, as the session header mounts it.
+ *
+ * @param {object} page - the mounted client half.
+ * @returns {() => object[]} one render pass.
+ */
+function renderBadgeOf(page) {
+  return () => page.loaded.hooks.render(page.badge.component, { sessionId: 'session-1' })
+}
+
+/** The badge button alone: the panel's buttons carry a variant of their own. */
+function badgeButtonOf(nodes) {
+  const found = nodes.filter((node) => node.type === 'button' && node.props.className === 'tls_badge')
+  assert.equal(found.length, 1, 'the header holds exactly one badge')
+  return found[0]
+}
+
+/** The open run panel. */
+function panelOf(nodes) {
+  const found = nodes.filter((node) => node.type === 'modal')
+  assert.equal(found.length, 1, 'exactly one run panel is open')
+  return found[0]
+}
+
+/** The phase pill of the open panel. */
+function phaseOf(nodes) {
+  const found = nodes.filter((node) => node.props.className === 'tls_phase')
+  assert.equal(found.length, 1, 'the panel shows the phase once')
+  return found[0]
+}
+
+/**
+ * The one element of a class.
+ *
+ * @param {object[]} nodes - rendered host elements.
+ * @param {string} className - the class the element must carry alone.
+ * @returns {object} the matched element.
+ */
+function byClass(nodes, className) {
+  const found = nodes.filter((node) => node.props.className === className)
+  assert.equal(found.length, 1, `exactly one element is "${className}"`)
+  return found[0]
+}
+
+/**
+ * The panel's action button that reads `label`.
+ *
+ * @param {object[]} nodes - rendered host elements.
+ * @param {string} label - visible label, which is the button's name.
+ * @returns {object} the matched element.
+ */
+function actionButtonOf(nodes, label) {
+  const found = nodes.filter((node) => node.type === 'button'
+    && node.props.className !== 'tls_badge'
+    && node.props.children === label)
+  assert.equal(found.length, 1, `exactly one action button reads "${label}"`)
+  return found[0]
+}
+
+/**
+ * A fake host the badge polls and the panel reads, and the browser's timer table.
+ *
+ * The badge asks `GET /api/openspec-taskloop/state` in an effect and then on an
+ * interval, so the test needs both halves under control: every fetch is recorded
+ * (with its options, so `no-store` is checked) and the interval is registered
+ * rather than waited out — one call to `tick()` is what two seconds would do.
+ *
+ * The panel adds the other two routes (task 8.2): `/tasks` answers the list the
+ * test supplies and can be replaced or refused between reads (task 8.3 — a refusal
+ * is a 503 whose body is the host's sentence and holds no list, exactly as
+ * `lib/routes.js` answers), and `/action` records the action it was sent and
+ * answers the snapshot the optional `onAction` produced, exactly as
+ * `lib/routes.js` answers with the state taken after the action.
+ *
+ * @param {unknown} initial - the first `/state` body the host answers with.
+ * @param {object} [options] - `tasks` (the `/tasks` body), `tasksRefusal` (the
+ *   sentence a refused read carries), `onAction` (the snapshot an action produces).
+ * @returns {object} the host: `answer(next)`, `answerTasks(next)`, `failTasks(reason)`,
+ *   `tick()`, and what it recorded.
+ */
+function createHost(initial, options = {}) {
+  let body = initial
+  let tasks = options.tasks ?? null
+  let refused = options.tasksRefusal ?? null
+  const calls = []
+  const actions = []
+  const timers = new Map()
+  let last = 0
+  return {
+    calls,
+    actions,
+    timers,
+    /** @param {unknown} next - the body the next `/state` answer carries. */
+    answer(next) { body = next },
+    /** @param {unknown} next - the body the next `/tasks` answer carries. */
+    answerTasks(next) { tasks = next; refused = null },
+    /** @param {string} reason - the sentence the next `/tasks` answer refuses with. */
+    failTasks(reason) { refused = reason; tasks = null },
+    /** @param {string} url - requested path. @param {object} init - request options. */
+    fetch(url, init = {}) {
+      calls.push({ url, init })
+      if (url === TASKS_URL) {
+        if (refused !== null) {
+          return Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({ error: refused }) })
+        }
+        if (tasks === null) return Promise.resolve({ ok: false, json: () => Promise.resolve(null) })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(tasks) })
+      }
+      if (url === ACTION_URL) {
+        const { action } = JSON.parse(init.body)
+        actions.push(action)
+        if (typeof options.onAction === 'function') body = options.onAction(action, body)
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ state: body }) })
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(body) })
+    },
+    setInterval(handler, ms) {
+      last += 1
+      timers.set(last, { handler, ms })
+      return last
+    },
+    clearInterval(id) { timers.delete(id) },
+    /** Run every live interval once. */
+    tick() {
+      for (const timer of Array.from(timers.values())) timer.handler()
+    },
+  }
 }
 
 /** The switches of a rendered page, in render order. */
@@ -330,9 +576,13 @@ test('apply mounts the page into settings.section under the designed identity', 
   assert.deepEqual(Array.from(exports.inject), ['slots', 'configForms'], 'the page waits for the slot registry and the config forms')
 
   assert.deepEqual(Array.from(page.entries), [CONFIG_ENTRY], 'the page edits the plugin\'s own config block')
-  assert.deepEqual(Array.from(page.injected), ['settings.section'], 'the page is a section of the settings shell')
+  assert.deepEqual(
+    Array.from(page.injected),
+    ['settings.section', 'conversation.session.header.utilities'],
+    'apply fills the settings nav and the session header row',
+  )
 
-  assert.equal(page.registrations.length, 1, 'one page, one registration')
+  assert.equal(page.registrations.length, 2, 'two contributions: the page and the run badge')
   const { options } = page.entry
   assert.equal(options.name, 'settings.section')
   assert.equal(options.id, 'openspec-taskloop', 'the nav row is addressed by this id')
@@ -340,8 +590,363 @@ test('apply mounts the page into settings.section under the designed identity', 
   assert.ok(options.order > 10, 'the page sits after Models (order 10)')
   assert.ok(options.order < 15, 'the page sits ahead of the Plugins section (order 15)')
 
-  assert.equal(page.effects.length, 1, 'the registration is owned by one effect, so it leaves with the plugin')
-  assert.match(page.effects[0], /settings page/u, 'the effect is named for what it owns')
+  assert.equal(page.effects.length, 2, 'each registration is owned by an effect, so both leave with the plugin')
+  assert.match(page.effects[0], /settings page/u, 'the first effect is named for what it owns')
+  assert.match(page.effects[1], /run badge/u, 'the second effect owns the badge')
+})
+
+test('the run badge mounts into the session header row and stays empty without a run', async () => {
+  const host = createHost({ active: false })
+  const page = mount(createForm({ status: 'ready', writable: true, value: VALUE }), host)
+
+  assert.ok(page.badge !== undefined, 'the header row gets a contribution of its own')
+  assert.equal(page.badge.options.id, 'openspec-taskloop-badge', 'the registration is addressed by the designed id')
+  assert.equal(page.badge.options.order, 30, 'the badge sits after the session\'s own utilities')
+  assert.equal(typeof page.badge.component, 'function', 'a slot contribution is a component')
+
+  const renderBadge = () => page.loaded.hooks.render(page.badge.component, { sessionId: 'session-1' })
+  const first = renderBadge()
+  assert.equal(first.length, 0, 'nothing is drawn before the first answer')
+
+  await settle()
+  assert.equal(renderBadge().length, 0, 'a host without a run draws no pill, not a disabled one')
+  assert.equal(host.calls.length, 1, 'the badge asks at once, not only on the first interval')
+})
+
+test('the badge names the phase and follows it: running, paused, gone after a stop', async () => {
+  const running = {
+    active: true,
+    phase: 'running',
+    change: 'add-pause-resume-ui',
+    cwd: 'C:\\work\\_dsh\\dsh-openspec-taskloop',
+    task: { id: '8.1', text: 'Register the badge', line: 45, done: false },
+    progress: { complete: 19, total: 24 },
+    sessionId: 'session-1',
+  }
+  const host = createHost(running)
+  const page = mount(createForm({ status: 'ready', writable: true, value: VALUE }), host)
+  const renderBadge = () => page.loaded.hooks.render(page.badge.component, { sessionId: 'session-1' })
+  const pill = () => {
+    const nodes = renderBadge()
+    const buttons = nodes.filter((node) => node.type === 'button')
+    assert.equal(buttons.length, 1, 'an active run is exactly one pill')
+    return buttons[0]
+  }
+
+  renderBadge()
+  await settle()
+  let badge = pill()
+
+  assert.equal(badge.type, 'button', 'the badge is a button, not a span with a click')
+  assert.equal(badge.props.type, 'button', 'a button outside a form does not submit anything')
+  assert.equal(badge.props['data-state'], 'running', 'the phase is carried by a data attribute, never inline')
+  assert.equal(badge.props['aria-haspopup'], 'dialog', 'the badge says that it opens a dialog')
+  assert.match(badge.props['aria-label'], /working/u, 'the accessible name carries the phase')
+  assert.equal(badge.props.title, badge.props['aria-label'], 'the mouse hint repeats the accessible name')
+
+  const [dot, label] = badge.props.children
+  assert.equal(dot.type, 'span')
+  assert.equal(dot.props['aria-hidden'], 'true', 'the dot is decoration and stays out of the tree')
+  assert.equal(String(label.props.children), 'Running', 'the label names the working phase')
+
+  assert.equal(host.calls[0].url, '/api/openspec-taskloop/state', 'the badge polls the state route of the plugin')
+  assert.equal(host.calls[0].init.cache, 'no-store', 'a cached answer would show a phase the run has left')
+
+  const [timer] = Array.from(host.timers.values())
+  assert.equal(timer.ms, 2000, 'the poll is one request every two seconds')
+
+  host.answer({ ...running, phase: 'paused' })
+  host.tick()
+  await settle()
+  badge = pill()
+  assert.equal(badge.props['data-state'], 'paused', 'a parked run reads as paused')
+  assert.match(badge.props['aria-label'], /paused/u, 'the name of a paused run says so')
+  assert.equal(String(badge.props.children[1].props.children), 'Paused', 'the label changes with the phase')
+
+  host.answer({ active: false })
+  host.tick()
+  await settle()
+  assert.equal(renderBadge().length, 0, 'a stopped run takes the badge out of the header')
+
+  page.loaded.hooks.dispose()
+  assert.equal(host.timers.size, 0, 'unmounting clears the interval')
+  const asked = host.calls.length
+  host.tick()
+  await settle()
+  assert.equal(host.calls.length, asked, 'no request outlives the header')
+})
+
+test('the badge opens the run panel: the change, the workspace, the bar and the tasks', async () => {
+  const host = createHost(RUN, { tasks: TASKS })
+  const page = mount(createForm({ status: 'ready', writable: true, value: VALUE }), host)
+  const renderBadge = renderBadgeOf(page)
+
+  renderBadge()
+  await settle()
+  assert.equal(renderBadge().filter((node) => node.type === 'modal').length, 0, 'the panel is closed until asked')
+
+  badgeButtonOf(renderBadge()).props.onClick()
+  const panel = panelOf(renderBadge())
+  assert.equal(panel.props.open, true, 'the click opens one panel')
+  assert.equal(badgeButtonOf(renderBadge()).props['aria-expanded'], 'true', 'the badge says that its panel is open')
+
+  await settle()
+  const nodes = renderBadge()
+
+  assert.match(panel.props.title, /taskloop run/u, 'the panel is named for the run it shows')
+  assert.equal(typeof panel.props.closeLabel, 'string', 'the close control has an accessible name')
+  assert.equal(typeof panel.props.onClose, 'function', 'the panel can be dismissed')
+
+  assert.equal(String(byClass(nodes, 'tls_runName').props.children), RUN.change, 'the panel names the change')
+  assert.equal(String(byClass(nodes, 'tls_runPath').props.children), RUN.cwd, 'the panel names the workspace')
+  assert.equal(byClass(nodes, 'tls_runPath').props.title, RUN.cwd, 'the whole path stays reachable when the text is cut')
+
+  assert.equal(phaseOf(nodes).props['data-state'], 'running', 'the panel shows the phase it is in')
+  assert.equal(String(phaseOf(nodes).props.children[1]), 'Running', 'the phase reads as a word, not only as a colour')
+
+  const bars = nodes.filter((node) => node.props.role === 'progressbar')
+  assert.equal(bars.length, 1, 'the panel shows one progress bar')
+  assert.equal(bars[0].props['aria-valuenow'], 20, 'the bar counts the CLI reading, not the poll')
+  assert.equal(bars[0].props['aria-valuemax'], 24, 'the bar is drawn against the total the CLI reported')
+  assert.equal(String(bars[0].props['aria-valuetext']), '20 / 24 tasks done')
+  assert.equal(String(byClass(nodes, 'tls_barText').props.children), '20 / 24 tasks done', 'the pair is also printed')
+  assert.equal(byClass(nodes, 'tls_barFill').props.style.width, (20 / 24) * 100 + '%')
+
+  const rows = nodes.filter((node) => node.type === 'li')
+  assert.equal(rows.length, TASKS.tasks.length, 'every task the CLI listed is a row')
+  assert.equal(rows[0].props['data-done'], 'true', 'a ticked task reads as done')
+  assert.match(String(rows[0].props['aria-label']), /^Done: /u, 'a done row says so in words')
+  assert.equal(rows[1].props['data-current'], 'true', 'the run\'s task is the current row')
+  assert.equal(rows[1].props['aria-current'], 'step', 'the current task is announced as the step')
+  assert.equal(rows[2].props['data-current'], 'false', 'a later task is not marked current')
+  assert.equal(String(rows[1].props.children[1].props.children), TASKS.tasks[1].description)
+
+  assert.equal(actionButtonOf(nodes, 'Pause').props.variant, 'primary', 'the phase-changing action is primary')
+  assert.equal(actionButtonOf(nodes, 'Pause').props.disabled, false)
+  assert.equal(actionButtonOf(nodes, 'Stop').props.variant, 'outline', 'stopping is not the default action')
+
+  const reads = host.calls.filter((call) => call.url === TASKS_URL)
+  assert.equal(reads.length, 1, 'the list is read once per open')
+  assert.equal(reads[0].init.cache, 'no-store', 'a cached list would show tasks the run has left')
+})
+
+test('the panel\'s buttons send the three commands and show the phase they produce', async () => {
+  const host = createHost(RUN, {
+    tasks: TASKS,
+    onAction: (action, current) => {
+      if (action === 'pause') return { ...current, phase: 'paused' }
+      if (action === 'resume') return { ...current, phase: 'running' }
+      return { active: false }
+    },
+  })
+  const page = mount(createForm({ status: 'ready', writable: true, value: VALUE }), host)
+  const renderBadge = renderBadgeOf(page)
+
+  renderBadge()
+  await settle()
+  badgeButtonOf(renderBadge()).props.onClick()
+  await settle()
+
+  actionButtonOf(renderBadge(), 'Pause').props.onClick()
+  const waiting = renderBadge()
+  assert.equal(actionButtonOf(waiting, 'Pause').props.disabled, true, 'the buttons wait for the answer')
+  assert.equal(actionButtonOf(waiting, 'Stop').props.disabled, true)
+
+  await settle()
+  let nodes = renderBadge()
+  assert.deepEqual(host.actions, ['pause'], 'the button sends the action the command dispatches')
+  const post = host.calls.filter((call) => call.url === ACTION_URL)[0]
+  assert.equal(post.init.method, 'POST')
+  assert.deepEqual(JSON.parse(post.init.body), { action: 'pause' })
+  assert.equal(phaseOf(nodes).props['data-state'], 'paused', 'the answer\'s phase is shown without waiting for the poll')
+  assert.equal(String(phaseOf(nodes).props.children[1]), 'Paused')
+
+  actionButtonOf(nodes, 'Resume').props.onClick()
+  await settle()
+  nodes = renderBadge()
+  assert.deepEqual(host.actions, ['pause', 'resume'])
+  assert.equal(phaseOf(nodes).props['data-state'], 'running')
+  assert.equal(actionButtonOf(nodes, 'Pause').props.disabled, false, 'the buttons come back after the answer')
+
+  actionButtonOf(nodes, 'Stop').props.onClick()
+  await settle()
+  assert.deepEqual(host.actions, ['pause', 'resume', 'stop'])
+  assert.equal(renderBadge().length, 0, 'the last answer takes the badge and its panel away')
+})
+
+test('the panel reads the list again when the run moves to the next task', async () => {
+  const host = createHost(RUN, { tasks: TASKS })
+  const page = mount(createForm({ status: 'ready', writable: true, value: VALUE }), host)
+  const renderBadge = renderBadgeOf(page)
+
+  renderBadge()
+  await settle()
+  badgeButtonOf(renderBadge()).props.onClick()
+  panelOf(renderBadge())
+  await settle()
+  assert.equal(host.calls.filter((call) => call.url === TASKS_URL).length, 1)
+
+  // The run finishes 8.2 and starts 8.3, and the next reading of the file has
+  // the tick and the new counts: both arrive only through a fresh list.
+  host.answer({ ...RUN, task: { ...RUN.task, id: '22', description: TASKS.tasks[2].description, line: 47 } })
+  host.answerTasks({
+    ...TASKS,
+    progress: { total: 24, complete: 21, remaining: 3 },
+    tasks: TASKS.tasks.map((task) => (task.line === 46 ? { ...task, done: true } : task)),
+  })
+  host.tick()
+  await settle()
+  renderBadge()
+  await settle()
+
+  const nodes = renderBadge()
+  assert.equal(host.calls.filter((call) => call.url === TASKS_URL).length, 2, 'a new current task reads the list again')
+  assert.equal(String(byClass(nodes, 'tls_barText').props.children), '21 / 24 tasks done', 'the fresh counts reach the bar')
+
+  const current = nodes.filter((node) => node.type === 'li' && node.props['data-current'] === 'true')
+  assert.equal(current.length, 1, 'exactly one row is the current task')
+  assert.equal(String(current[0].props.children[1].props.children), TASKS.tasks[2].description)
+
+  const finished = nodes.filter((node) => node.type === 'li' && node.props['data-done'] === 'true')
+  assert.equal(finished.length, 2, 'the tick the model added arrives with the same read')
+})
+
+test('closing the panel frees it, and reopening reads the list afresh', async () => {
+  const host = createHost(RUN, { tasks: TASKS })
+  const page = mount(createForm({ status: 'ready', writable: true, value: VALUE }), host)
+  const renderBadge = renderBadgeOf(page)
+
+  renderBadge()
+  await settle()
+  badgeButtonOf(renderBadge()).props.onClick()
+  await settle()
+
+  panelOf(renderBadge()).props.onClose()
+  assert.equal(renderBadge().filter((node) => node.type === 'modal').length, 0, 'closing removes the panel')
+
+  badgeButtonOf(renderBadge()).props.onClick()
+  await settle()
+  panelOf(renderBadge())
+  assert.equal(host.calls.filter((call) => call.url === TASKS_URL).length, 2, 'each open costs one read of the list')
+})
+
+test('the body says that it is reading the list until the answer arrives', async () => {
+  const host = createHost(RUN, { tasks: TASKS })
+  const page = mount(createForm({ status: 'ready', writable: true, value: VALUE }), host)
+  const renderBadge = renderBadgeOf(page)
+
+  renderBadge()
+  await settle()
+  badgeButtonOf(renderBadge()).props.onClick()
+
+  const reading = renderBadge()
+  panelOf(reading)
+  const note = byClass(reading, 'tls_taskNote')
+  assert.equal(note.props['data-state'], 'loading', 'the read says what it is doing, not that the change is empty')
+  assert.equal(note.props.role, 'status', 'the note announces itself when it changes')
+  assert.equal(String(note.props.children), 'Reading the task list…')
+  assert.equal(byClass(reading, 'tls_tasksTitle').props.children, 'Tasks', 'the section keeps its heading while it loads')
+  assert.equal(reading.filter((node) => node.type === 'li').length, 0, 'no rows are invented while the read is out')
+  assert.equal(
+    String(byClass(reading, 'tls_barText').props.children),
+    '19 / 24 tasks done',
+    'the bar falls back to the counts the poll already knows',
+  )
+
+  await settle()
+  const answered = renderBadge()
+  assert.equal(answered.filter((node) => node.props.className === 'tls_taskNote').length, 0, 'the note leaves with the answer')
+  assert.equal(answered.filter((node) => node.type === 'li').length, TASKS.tasks.length, 'the rows arrive in its place')
+  assert.equal(
+    String(byClass(answered, 'tls_barText').props.children),
+    '20 / 24 tasks done',
+    'the bar takes the fresh reading over the poll',
+  )
+})
+
+test('a refused read says the list is unavailable, never an empty list', async () => {
+  const reason = 'the task list is unavailable: openspec is not on the PATH'
+  const host = createHost(RUN, { tasks: TASKS, tasksRefusal: reason })
+  const page = mount(createForm({ status: 'ready', writable: true, value: VALUE }), host)
+  const renderBadge = renderBadgeOf(page)
+
+  renderBadge()
+  await settle()
+  badgeButtonOf(renderBadge()).props.onClick()
+  panelOf(renderBadge())
+  await settle()
+
+  const nodes = renderBadge()
+  panelOf(nodes)
+  const note = byClass(nodes, 'tls_taskNote')
+  assert.equal(note.props['data-state'], 'unavailable')
+  assert.equal(String(note.props.children), reason, 'the host\'s own sentence is what the panel repeats')
+  assert.equal(note.props.role, 'status')
+  assert.equal(nodes.filter((node) => node.type === 'li').length, 0, 'a failed read draws no rows')
+  assert.equal(
+    nodes.filter((node) => node.props.className === 'tls_taskList').length,
+    0,
+    'and no list either, so nothing reads as an empty change',
+  )
+  assert.equal(
+    String(byClass(nodes, 'tls_barText').props.children),
+    '19 / 24 tasks done',
+    'the bar keeps the last counts the run reported',
+  )
+
+  // The panel is not stuck in the refusal: the next read of the same open — the
+  // run moving on — replaces it with the rows.
+  host.answerTasks(TASKS)
+  host.answer({ ...RUN, task: { ...RUN.task, id: '22', line: 47 } })
+  host.tick()
+  await settle()
+  renderBadge()
+  await settle()
+  const recovered = renderBadge()
+  assert.equal(recovered.filter((node) => node.props.className === 'tls_taskNote').length, 0, 'a later read clears the refusal')
+  assert.equal(recovered.filter((node) => node.type === 'li').length, TASKS.tasks.length)
+})
+
+test('a change with no tasks is told apart from a list that could not be read', async () => {
+  const host = createHost(RUN, { tasks: { ...TASKS, tasks: [] } })
+  const page = mount(createForm({ status: 'ready', writable: true, value: VALUE }), host)
+  const renderBadge = renderBadgeOf(page)
+
+  renderBadge()
+  await settle()
+  badgeButtonOf(renderBadge()).props.onClick()
+  panelOf(renderBadge())
+  await settle()
+
+  const nodes = renderBadge()
+  const note = byClass(nodes, 'tls_taskNote')
+  assert.equal(note.props['data-state'], 'empty', 'an answered empty change is not a refusal')
+  assert.equal(String(note.props.children), 'This change lists no tasks.')
+  assert.equal(nodes.filter((node) => node.type === 'li').length, 0)
+  assert.equal(
+    String(byClass(nodes, 'tls_barText').props.children),
+    '20 / 24 tasks done',
+    'the counts still come from the answer, which happened',
+  )
+})
+
+test('closing the panel puts focus back on the badge', async () => {
+  const host = createHost(RUN, { tasks: TASKS })
+  const page = mount(createForm({ status: 'ready', writable: true, value: VALUE }), host)
+  const renderBadge = renderBadgeOf(page)
+
+  renderBadge()
+  await settle()
+  assert.equal(badgeButtonOf(renderBadge()).focused, undefined, 'a badge alone is not given focus')
+
+  badgeButtonOf(renderBadge()).props.onClick()
+  await settle()
+  panelOf(renderBadge()).props.onClose()
+
+  const closed = renderBadge()
+  assert.equal(closed.filter((node) => node.type === 'modal').length, 0, 'the panel is gone')
+  assert.equal(badgeButtonOf(closed).focused, true, 'and the control that opened it has the focus again')
+  assert.equal(badgeButtonOf(closed).props['aria-expanded'], 'false', 'the badge says its panel is closed')
 })
 
 test('the page shows the eight switches and choices the config holds', () => {
