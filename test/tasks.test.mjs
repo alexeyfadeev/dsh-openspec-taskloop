@@ -21,6 +21,7 @@ import {
   ApplyError,
   NEXT_TASK,
   findListedTask,
+  findTaskByNumber,
   parseApplyInstructions,
   RUN_STATE,
   selectNextTask,
@@ -182,6 +183,101 @@ test('a sent task is found again by file, line and text, whatever its checkbox s
 
   const rewritten = parseApplyInstructions(documentOf({ tasks: [{ ...sent, description: '2.3 Do more' }] }))
   assert.equal(findListedTask(rewritten, sent), undefined)
+})
+
+test('a task that only moved down is found again by its number', () => {
+  const sent = { id: '5', description: '2.3 Добавить парсер', done: false, sourcePath: 'C:/p/tasks.md', line: 12 }
+
+  // A row was inserted above, so the checkbox sits two lines lower while the
+  // text is untouched. The verbatim triple misses; the number does not.
+  const moved = parseApplyInstructions(
+    documentOf({
+      tasks: [
+        { id: '4', description: '2.2 Сделать что-то раньше', done: true, sourcePath: 'C:/p/tasks.md', line: 31 },
+        { id: '5', description: '2.3 Добавить парсер', done: true, sourcePath: 'C:/p/tasks.md', line: 12 + 2 },
+      ],
+    }),
+  )
+
+  assert.equal(findListedTask(moved, sent), undefined)
+
+  const found = findTaskByNumber(moved, sent)
+  // The tick is the answer the loop is looking for, so the found row speaks for
+  // itself rather than being judged by the number alone.
+  assert.equal(found?.line, 14)
+  assert.equal(found?.description, '2.3 Добавить парсер')
+  assert.equal(found?.done, true)
+})
+
+test('a task that moved and was edited is still found by its number', () => {
+  const sent = { id: '5', description: '2.3 Добавить парсер', done: false, sourcePath: 'C:/p/tasks.md', line: 12 }
+
+  // Both halves of the identity drift at once: the line shifts and the model
+  // appended a note. Only the number links the row to what was sent; whether the
+  // wording is still the same task is the classifier's question, not this one's.
+  const rewritten = parseApplyInstructions(
+    documentOf({
+      tasks: [
+        { id: '5', description: '2.3 Добавить парсер — готово, покрыто тестами', done: true, sourcePath: 'C:/p/tasks.md', line: 13 },
+      ],
+    }),
+  )
+
+  assert.equal(findListedTask(rewritten, sent), undefined)
+
+  const found = findTaskByNumber(rewritten, sent)
+  assert.equal(found?.line, 13)
+  assert.equal(found?.description, '2.3 Добавить парсер — готово, покрыто тестами')
+})
+
+test('a number the fresh reading no longer lists is not found', () => {
+  const sent = { id: '5', description: '2.3 Добавить парсер', done: false, sourcePath: 'C:/p/tasks.md', line: 12 }
+
+  const withoutIt = parseApplyInstructions(
+    documentOf({
+      tasks: [{ id: '5', description: '2.4 Сделать другое', done: false, sourcePath: 'C:/p/tasks.md', line: 12 }],
+    }),
+  )
+
+  // No number match means the row was deleted or replaced: `gone` is the caller's
+  // answer, and guessing another row would be worse than stopping.
+  assert.equal(findTaskByNumber(withoutIt, sent), undefined)
+})
+
+test('two rows with the same number are told apart by the sent line', () => {
+  const sent = { id: '9', description: '11.4 Проверить дубль', done: false, sourcePath: 'C:/p/tasks.md', line: 40 }
+
+  // A list can hold the same number twice, after a copy-paste or a merge, and the
+  // number alone then names two rows. Guessing would let the loop read a
+  // stranger's tick as its own answer, so proximity to the sent line decides.
+  const near = { id: '9', description: '11.4 Проверить дубль', done: true, sourcePath: 'C:/p/tasks.md', line: 38 }
+  const far = { id: '9', description: '11.4 Проверить дубль', done: false, sourcePath: 'C:/p/tasks.md', line: 120 }
+
+  const doubled = parseApplyInstructions(documentOf({ tasks: [far, near] }))
+  assert.equal(findListedTask(doubled, sent), undefined)
+  assert.equal(findTaskByNumber(doubled, sent)?.line, 38)
+
+  // Order in the array is an accident of the document's layout, not evidence: the
+  // near copy wins whether it is listed before or after the far one.
+  const reversed = parseApplyInstructions(documentOf({ tasks: [near, far] }))
+  assert.equal(findTaskByNumber(reversed, sent)?.line, 38)
+})
+
+test('a number that only appears in another file is not the sent task', () => {
+  const sent = { id: '5', description: '2.3 Добавить парсер', done: false, sourcePath: 'C:/p/tasks.md', line: 12 }
+
+  // Numbers are unique inside one list, not across a project: another change's
+  // file also has a `2.3`, and it is even ticked. Accepting it would report
+  // someone else's completed task as this run's answer.
+  const elsewhere = parseApplyInstructions(
+    documentOf({
+      tasks: [
+        { id: '5', description: '2.3 Добавить парсер', done: true, sourcePath: 'C:/p/other/tasks.md', line: 12 },
+      ],
+    }),
+  )
+
+  assert.equal(findTaskByNumber(elsewhere, sent), undefined)
 })
 
 test('rejects output that is not a usable document', () => {
