@@ -369,6 +369,9 @@ test('a checked task advances the run to the next one, and the file is read afte
 
   assert.equal(outcome.kind, LOOP_END.unmarked)
   assert.deepEqual(outcome.sent.map((task) => task.line), [12, 13])
+  // No row was reworded, so the outcome carries no acceptances at all — not an empty list: the
+  // report only learns about a change of wording when there was one (6.2).
+  assert.equal(outcome.accepted, undefined)
   // The run's position is published task by task, as each message leaves.
   assert.deepEqual(noted, [12, 13])
   assert.equal(messages.length, 2)
@@ -554,6 +557,12 @@ test('a ticked task with an appended note is accepted and the run moves on', asy
     'read',
   ])
   assert.equal(cli.calls.length, 3)
+  // The wording the run adopted travels with the outcome, band included, so the report can
+  // name the change without turning it into a stop (6.2).
+  assert.deepEqual(
+    outcome.accepted.map((entry) => [entry.task.description.split(' ')[0], entry.divergence]),
+    [['2.3', DIVERGENCE.minor]],
+  )
 })
 
 test('an accepted wording on an unchecked row is sent again with the new text', async () => {
@@ -637,6 +646,12 @@ test('an uncertain divergence the model ticks is taken as the same task', async 
     'read',
   ])
   assert.equal(cli.calls.length, 4)
+  // The wording the turn confirmed is an adopted one too, and its band says which rung of the
+  // ladder adopted it (6.2).
+  assert.deepEqual(
+    outcome.accepted.map((entry) => [entry.task.description.split(' ')[0], entry.divergence]),
+    [['2.3', DIVERGENCE.gray]],
+  )
 })
 
 test('an uncertain divergence the model leaves alone asks the user, who sends it again', async () => {

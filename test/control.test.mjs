@@ -18,6 +18,7 @@ import { createButBranch } from '../lib/commit.js'
 import { COMMIT_TEXT } from '../lib/commit-text.js'
 import { resolveConfig } from '../lib/config.js'
 import { createControl } from '../lib/control.js'
+import { DIVERGENCE_ANSWER } from '../lib/diverged.js'
 import {
   EXPLORE_ANSWER,
   EXPLORE_MODE_PROMPT,
@@ -133,6 +134,99 @@ function tickedApplyIn(text, lines) {
 }
 
 /**
+ * A captured document with the row at `line` removed, as it reads after an edit that
+ * moved the task out from under the run.
+ *
+ * @param {number} line - line of the row to drop.
+ * @returns {string} JSON text of the shortened document.
+ */
+function withoutLine(line) {
+  const document = JSON.parse(applyFixture('ready.json'))
+  document.tasks = document.tasks.filter((task) => task.line !== line)
+  return JSON.stringify(document)
+}
+
+/**
+ * A captured document with one row's wording replaced wholesale.
+ *
+ * What the model leaves behind when it rewrites the row it was given rather than appending
+ * to it: the wording is no longer the one that was sent, while the number, the file and the
+ * line stay put. How far that counts as a divergence is the classifier's call, which is why
+ * the tests below use only signatures the classifier pins (5.1–5.3).
+ *
+ * @param {string} text - document to edit.
+ * @param {number} line - row to rewrite.
+ * @param {string} description - the wording that row now carries.
+ * @returns {string} JSON text of the edited document.
+ */
+function renamed(text, line, description) {
+  const document = JSON.parse(text)
+  document.tasks.find((task) => task.line === line).description = description
+  return JSON.stringify(document)
+}
+
+/** Note a model appends to a row it also ticks: the incident's shape (design D4). */
+const NOTE = ' (примечание: резолвер вынесен в отдельный модуль)'
+
+/**
+ * A captured document with a note appended to one row's wording.
+ *
+ * What the model leaves behind when it annotates the row it finished instead of rewriting
+ * it: the sent wording survives whole, which is the `minor` drift the run adopts on its own
+ * (design D4) and therefore the one the report calls an accepted change rather than a stop.
+ *
+ * @param {string} text - document to edit.
+ * @param {number} line - row to annotate.
+ * @param {string} [note] - text appended to that row.
+ * @returns {string} JSON text of the edited document.
+ */
+function noted(text, line, note = NOTE) {
+  const document = JSON.parse(text)
+  document.tasks.find((task) => task.line === line).description += note
+  return JSON.stringify(document)
+}
+
+/**
+ * The incident's own two rows — 11.4 and 11.5 — as the run that reworded 11.4 saw them.
+ *
+ * The change exists because a run stopped on 11.4 after the model ticked it and appended a note
+ * to its wording, instead of going on to 11.5 (`proposal.md`, «Инцидент»). The rows keep the
+ * captured document's wordings under the incident's numbering, so the report the tests read
+ * names the labels the user reported, and the classifier still sees rows its bands were pinned
+ * on. `ready.json` spells 11.4 on line 12 and 11.5 on line 13, which is where the note goes.
+ *
+ * @param {object} options
+ * @param {number[]} options.done - rows that are ticked, by the line they hold in `ready.json`.
+ * @param {string} [options.note] - note appended to the wording of 11.4.
+ * @returns {string} JSON text of the document.
+ */
+function incidentApply({ done, note }) {
+  const document = JSON.parse(applyFixture('ready.json'))
+  document.tasks = document.tasks
+    .filter((task) => task.line === 12 || task.line === 13)
+    .map((task) => ({
+      ...task,
+      description: task.description.replace(/^\d+\.\d+ /u, task.line === 12 ? '11.4 ' : '11.5 '),
+      done: done.includes(task.line),
+    }))
+  document.progress = {
+    total: document.tasks.length,
+    complete: done.length,
+    remaining: document.tasks.length - done.length,
+  }
+  document.state = done.length === document.tasks.length ? 'all_done' : 'ready'
+  const renumbered = JSON.stringify(document)
+  return note === undefined ? renumbered : noted(renumbered, 12, note)
+}
+
+/** Row 2.3 with its opening rewritten and its tail kept: the uncertain band (design D5). */
+const GRAY_2_3 = '2.3 Разобрать JSON-вывод `openspec instructions apply` и выбрать первую '
+  + 'невыполненную задачу; проверить тестами состояния `ready`, `blocked` и `all_done`'
+
+/** Row 2.3 replaced by an unrelated task under the same number: the major band (design D6). */
+const MAJOR_2_3 = '2.3 Обновить README и раздел про настройки'
+
+/**
  * Build the exit facts of one CLI call.
  *
  * @param {string} stdout - collected stdout.
@@ -219,6 +313,9 @@ function recordingPrompt() {
  *   text and, for GitButler, the branch (5.2, 7.3).
  * @param {Function} [options.forgetCommitText] - dropping the stored text of a finished change (5.3).
  * @param {Function} [options.cancelTurn] - the session turn a pause or a stop ends (5.2).
+ * @param {Function} [options.confirmDiverged] - the significance card of the divergence
+ *   change (4.3, design D6): the user's answer about a wording that drifted too far. Absent,
+ *   a deployment nobody can ask stops the run.
  * @param {object} [options.runs] - the run slot the control should use instead of creating
  *   one (7.3): the mount passes the slot its routes read, so both surfaces see one run.
  * @returns {{control: object, asked: object[], descriptions: object[], messages: object[], approvals: string[], cancellations: string[], agent: object, forgotten: object[]}}
@@ -243,6 +340,7 @@ function harness({
   forgetCommitText,
   appendNotice,
   cancelTurn,
+  confirmDiverged,
   runs,
 }) {
   const asked = []
@@ -288,6 +386,7 @@ function harness({
     normalizeEol,
     commitInput,
     appendNotice,
+    confirmDiverged,
     // Every test gets the seam, so "nothing was cancelled" is a recorded answer rather
     // than the absence of a dependency (5.2). An answer that is not `true` stands for the
     // refusals the real seam turns into a log line instead of a throw.
@@ -332,6 +431,185 @@ test('a run stops with a report when the task is left unchecked', async () => {
   // The listing, then the read that sent 2.3, then the read after its turn.
   assert.equal(cli.calls.length, 3)
   assert.equal(cli.calls[1].options.cwd, CWD)
+})
+
+test('a task whose row was deleted is reported with its number, file and sent line', async () => {
+  // Design D7 of the divergence change: `missing` is gone, so a deletion has a sentence of its
+  // own. The row is not where the run last saw it, which is why the file and the line it was
+  // sent from are named — the number alone would not tell the user what to open.
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(withoutLine(12)),
+  ])
+  const { control, agent } = harness({ createCli: () => cli })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'error')
+  assert.match(
+    result.text,
+    /sent task 2\.3, but tasks\.md no longer lists 2\.3 \(sent from .*add-taskloop-plugin\\tasks\.md:12\)/u,
+  )
+  assert.match(result.text, /the row was deleted or moved out of the file/u)
+  assert.match(result.text, /the run stopped and no further task was sent/u)
+})
+
+test('a declined question about a drifted row is reported with its band and the choice', async () => {
+  // The significant band asks nobody but the user (design D6), who declines it (5.3). The report
+  // names the band, the address the row was sent from, and the fact that a person said no — not
+  // "unanswered", which is the other way this stop can end.
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(renamed(applyFixture('ready.json'), 12, MAJOR_2_3)),
+  ])
+  const asked = []
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    confirmDiverged: async (invocationArg, context) => {
+      asked.push({ invocation: invocationArg, context })
+      return { kind: DIVERGENCE_ANSWER.stop }
+    },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'error')
+  assert.match(
+    result.text,
+    /but the wording of 2\.3 drifted \(significant drift, sent from .*add-taskloop-plugin\\tasks\.md:12\)/u,
+  )
+  assert.match(result.text, /the user did not choose to continue it/u)
+  // The card was about this row and carried both wordings of it.
+  assert.equal(asked.length, 1)
+  assert.equal(asked[0].context.task.line, 12)
+  assert.match(asked[0].context.previous, /^2\.3 Реализовать разбор/u)
+  // No adjudication turn belongs to this band: one task was sent, and no second one followed.
+  assert.equal(messages.length, 1)
+})
+
+test('a drift nobody can be asked about is reported as a stop without a channel', async () => {
+  // No question seam at all (5.3): the run may not adopt a wording no person vouched for, so it
+  // stops and says that nobody could be asked — the band is still named, because it is the reason
+  // the question was unavoidable.
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(renamed(applyFixture('ready.json'), 12, GRAY_2_3)),
+  ])
+  const { control, agent } = harness({ createCli: () => cli })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'error')
+  assert.match(
+    result.text,
+    /but the wording of 2\.3 drifted \(uncertain drift, sent from .*add-taskloop-plugin\\tasks\.md:12\)/u,
+  )
+  assert.match(result.text, /and nobody could be asked whether to continue it/u)
+  assert.match(result.text, /the run stopped and no further task was sent/u)
+})
+
+test('a ticked row under a replaced wording is reported as already done', async () => {
+  // The work happened, but not under the task the run reported (5.3): there is nothing left to
+  // send, so this stop may not read like the deletion above — the report says the box was already
+  // ticked and names the band that made the row unrecognisable.
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(tickedApplyIn(renamed(applyFixture('ready.json'), 12, MAJOR_2_3), [12])),
+  ])
+  const { control, agent } = harness({ createCli: () => cli })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /\(significant drift, sent from .*add-taskloop-plugin\\tasks\.md:12\)/u)
+  assert.match(result.text, /and the row was already checked/u)
+  assert.match(result.text, /nothing was left to run under that wording/u)
+})
+
+test('a reworded flat row is reported with the missing number key', async () => {
+  // Design D10 and the spec's «Задача без номера»: a flat list has no second key, so the stop may
+  // not claim the row was deleted while it is still in the file. The task is named as the flat
+  // list knows it — by its id — and the refusal is named after what the reading lacked.
+  const flat = flatApply()
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(flat),
+    cliResult(renamed(flat, 12, 'Разобрать вывод CLI и выбрать первую невыполненную задачу')),
+  ])
+  const { control, agent } = harness({ createCli: () => cli })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'error')
+  assert.match(
+    result.text,
+    /sent task 5, but the row read back from the file cannot be tied to task 5 \(sent from .*add-taskloop-plugin\\tasks\.md:12\)/u,
+  )
+  assert.match(result.text, /it carries no N\.M number to look a reworded row up by/u)
+  assert.match(result.text, /the run stopped and no further task was sent/u)
+})
+
+test('a row left with only its number is reported with nothing left to compare', async () => {
+  // The same impossibility from the other side (5.4): the number was found, and the row says
+  // nothing else. Its sentence is its own, because "no wording to compare" is a different thing
+  // to fix than "no number to look by".
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(applyFixture('ready.json')),
+    cliResult(renamed(applyFixture('ready.json'), 12, '2.3')),
+  ])
+  const { control, agent } = harness({ createCli: () => cli })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'error')
+  assert.match(
+    result.text,
+    /cannot be tied to task 2\.3 \(sent from .*add-taskloop-plugin\\tasks\.md:12\): the row has no wording left to compare/u,
+  )
+  assert.match(result.text, /the run stopped and no further task was sent/u)
+})
+
+test('an accepted reformulation of 11.4 is reported as a change and the run still succeeds', async () => {
+  // The incident this change was written for (design D4): the model ticked 11.4 and appended a
+  // note, so the row is no longer the wording that was sent while the task is the same. The
+  // report names the change and the band, the run goes on to 11.5, and the ending is the success
+  // the file earned — an accepted wording may not read as one of the stops (6.2).
+  const cli = scriptedCli([
+    cliResult(fixture('repo.json')),
+    cliResult(incidentApply({ done: [] })),
+    cliResult(incidentApply({ done: [12], note: NOTE })),
+    cliResult(incidentApply({ done: [12, 13], note: NOTE })),
+  ])
+  const { control, messages, agent } = harness({
+    createCli: () => cli,
+    // The group's review and commit are not what this report is about, and both would have to be
+    // answered by services this test does not fake.
+    config: { review: { enabled: false }, commit: { enabled: false } },
+  })
+
+  const result = await control.run(invocation(agent), { change: null })
+
+  assert.equal(result.kind, 'success')
+  // The ending is the run's own, taken from the last reading rather than the listing.
+  assert.match(result.text, /\(2\/2 tasks done\)/u)
+  assert.match(result.text, /sent tasks 11\.4 and 11\.5; all tracked tasks are complete\./u)
+  // The change of wording follows the ending as a sentence of its own, with the band that let the
+  // run settle it by itself instead of asking.
+  assert.match(
+    result.text,
+    /The wording of task 11\.4 changed and was accepted \(minor drift\); the run continued with it\./u,
+  )
+  // Nothing in this report may read like one of the stops: the clause replaces no verdict and
+  // adds no error.
+  assert.doesNotMatch(result.text, /no further task was sent|the run stopped/u)
+  // And the run really did move on: 11.5 was sent after the accepted wording of 11.4.
+  assert.equal(messages.length, 2)
+  assert.match(messages[1].content[0].text, /выполни task 11\.5/u)
 })
 
 test('a checked task advances the run to the next one', async () => {
