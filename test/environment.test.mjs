@@ -26,6 +26,7 @@ import { COMMIT_END, runCommit } from '../lib/commit.js'
 import { ANCHOR_QUESTION_ID, BRANCH_QUESTION_ID } from '../lib/commit-input.js'
 import { COMMIT_MESSAGE_QUESTION_ID, COMMIT_TEXT } from '../lib/commit-text.js'
 import { resolveConfig } from '../lib/config.js'
+import { DIVERGENCE_ANSWER, DIVERGENCE_LABEL, DIVERGENCE_QUESTION_ID } from '../lib/diverged.js'
 import { createEnvironment, resolveCwd } from '../lib/environment.js'
 import {
   DESCRIPTION_QUESTION_ID,
@@ -64,6 +65,18 @@ function fakeCtx(services, warnings) {
  * @returns {object} fake agent.
  */
 const agentWith = (cwd) => ({ id: 'agent-1', session: { header: cwd === undefined ? {} : { cwd } } })
+
+/** A task row as a fresh reading reports it; the number lives in the description. */
+const DIVERGED_TASK = {
+  id: '11',
+  description: '11.4 Переписать обработчик возврата',
+  done: false,
+  sourcePath: 'openspec/changes/demo/tasks.md',
+  line: 24,
+}
+
+/** The wording the run sent for that row, before the file changed under it. */
+const SENT_WORDING = '11.4 Починить обработчик возврата'
 
 test('the session working directory comes from the working-directory service', () => {
   const ctx = fakeCtx({ workingDirectory: { get: () => '/work/project' } })
@@ -154,6 +167,86 @@ test('the description question goes to the session user-questions service', asyn
   assert.equal(asked[0].agent, invocation.agent)
   assert.equal(asked[0].signal, signal)
   assert.match(asked[0].questions[0].question, /\/work\/demo/)
+})
+
+test('the divergence question goes to the session user-questions service', async () => {
+  const asked = []
+  const questions = {
+    async ask(request) {
+      asked.push(request)
+      return { answers: [{ id: DIVERGENCE_QUESTION_ID, selected: [DIVERGENCE_LABEL.continue] }] }
+    },
+  }
+  const environment = createEnvironment(fakeCtx({ userQuestions: questions }), resolveConfig())
+  const signal = new AbortController().signal
+  const invocation = { agent: { id: 'agent-1' }, signal }
+
+  const outcome = await environment.confirmDiverged(invocation, {
+    change: 'demo',
+    previous: SENT_WORDING,
+    task: DIVERGED_TASK,
+  })
+
+  assert.deepEqual(outcome, { kind: DIVERGENCE_ANSWER.continue })
+  assert.equal(asked.length, 1)
+  assert.equal(asked[0].agent, invocation.agent)
+  assert.equal(asked[0].signal, signal)
+  const [card] = asked[0].questions
+  assert.match(card.question, /11\.4/)
+  assert.deepEqual(
+    card.options.map((option) => option.label),
+    [DIVERGENCE_LABEL.continue, DIVERGENCE_LABEL.stop],
+  )
+  assert.match(card.detail, new RegExp(`Было: ${SENT_WORDING}`))
+  assert.match(card.detail, /Стало: 11\.4 Переписать/)
+})
+
+test('the divergence card stops the run when the user chooses to stop', async () => {
+  const questions = {
+    async ask() {
+      return { answers: [{ id: DIVERGENCE_QUESTION_ID, selected: [DIVERGENCE_LABEL.stop] }] }
+    },
+  }
+  const environment = createEnvironment(fakeCtx({ userQuestions: questions }), resolveConfig())
+
+  const outcome = await environment.confirmDiverged(
+    { agent: { id: 'agent-1' } },
+    { change: 'demo', previous: SENT_WORDING, task: DIVERGED_TASK },
+  )
+
+  assert.deepEqual(outcome, { kind: DIVERGENCE_ANSWER.stop })
+})
+
+test('without a user-questions service the divergence question is unavailable, never consent', async () => {
+  const environment = createEnvironment(fakeCtx({}), resolveConfig())
+
+  const outcome = await environment.confirmDiverged(
+    { agent: { id: 'agent-1' } },
+    { change: 'demo', previous: SENT_WORDING, task: DIVERGED_TASK },
+  )
+
+  assert.deepEqual(outcome, { kind: DIVERGENCE_ANSWER.unavailable })
+})
+
+test('the run signal ends the divergence card, not the request one', async () => {
+  const asked = []
+  const questions = {
+    async ask(request) {
+      asked.push(request)
+      return { answers: [] }
+    },
+  }
+  const environment = createEnvironment(fakeCtx({ userQuestions: questions }), resolveConfig())
+  const requestSignal = new AbortController().signal
+  const runSignal = new AbortController().signal
+
+  await environment.confirmDiverged(
+    { agent: { id: 'agent-1' }, signal: requestSignal },
+    { change: 'demo', previous: SENT_WORDING, task: DIVERGED_TASK, signal: runSignal },
+  )
+
+  assert.equal(asked.length, 1)
+  assert.equal(asked[0].signal, runSignal)
 })
 
 test('the explore follow-up goes to the invocation agent, once', () => {

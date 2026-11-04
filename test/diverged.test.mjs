@@ -1,9 +1,12 @@
 // Tests for divergence classification (tasks 1.1–1.4), the adjudication prompt
-// (task 3.1) and the adjudication turn itself (task 3.2): the normalisation every
-// later comparison is built on, the containment rule that decides the incident, the
-// edit distance whose similarity places a drift in one of three bands, the
-// classifier that orders those steps and refuses the pairs it cannot judge, the one
-// turn a gray divergence is worth, and the verdict that turn is read through.
+// (task 3.1) and the adjudication turn itself (task 3.2), the question a
+// significant divergence asks the user (task 4.1) and the seam that asks it and
+// reads the answer (task 4.2): the normalisation every later comparison is built
+// on, the containment rule that decides the incident, the edit distance whose
+// similarity places a drift in one of three bands, the classifier that orders those
+// steps and refuses the pairs it cannot judge, the one turn a gray divergence is
+// worth, the verdict that turn is read through, the card that puts a major
+// divergence to the person, and the three answers that card can settle with.
 //
 // The 11.4 row is the one from docs/taskloop-missing-stop-2026-11-03.md. That
 // report keeps the shape of the row rather than its exact words — the incident
@@ -27,15 +30,20 @@ import { test } from 'node:test'
 import {
   ADJUDICATION_END,
   DIVERGENCE,
+  DIVERGENCE_ANSWER,
+  DIVERGENCE_LABEL,
+  DIVERGENCE_QUESTION_ID,
   DIVERGENCE_REFUSAL,
   SIMILARITY_GRAY,
   SIMILARITY_MINOR,
   buildAdjudicationPrompt,
+  buildDivergenceQuestion,
   classifyByContainment,
   classifyBySimilarity,
   classifyDivergence,
   levenshteinDistance,
   normalizeDescription,
+  requestContinuation,
   runAdjudication,
   similarityRatio,
 } from '../lib/diverged.js'
@@ -82,6 +90,9 @@ const ADJUDICATION_TASK = {
   sourcePath: SOURCE,
   line: 61,
 }
+
+/** The row a major divergence replaces the sent one with (design D6, task 4.2). */
+const MAJOR_TASK = { ...ADJUDICATION_TASK, description: INCIDENT_ROW_REPLACEMENT }
 
 
 test('the incident row 11.4 loses its number and keeps its wording', () => {
@@ -693,5 +704,265 @@ test('a turn that fails to start is an error, not a stop', async (t) => {
   await assert.rejects(
     () => runAdjudication({ agent, change: CHANGE, previous: INCIDENT_ROW_SENT, task: grayTask(path) }),
     /the agent is gone/u,
+  )
+})
+
+test('the divergence question shows both wordings and offers continue or stop', () => {
+  // Design D6 / task 4.1: the card is what the human decides from, so the whole
+  // question is pinned — the number it names, what was sent, what the file now
+  // says, and the two ways out. The labels are also the answer the run reads back
+  // (task 4.2), which is why they are asserted by name and not only by the
+  // deep-equal above.
+  const card = buildDivergenceQuestion({
+    change: CHANGE,
+    previous: INCIDENT_ROW_SENT,
+    task: { ...ADJUDICATION_TASK, description: INCIDENT_ROW_REPLACEMENT },
+  })
+
+  assert.deepEqual(card, {
+    id: DIVERGENCE_QUESTION_ID,
+    header: 'OpenSpec',
+    question: 'Формулировка задачи `11.4` изменилась. Продолжить выполнение этой задачи?',
+    detail: `Было: ${INCIDENT_ROW_SENT}\nСтало: ${INCIDENT_ROW_REPLACEMENT}`,
+    options: [{ label: 'Продолжить' }, { label: 'Остановить taskloop' }],
+  })
+
+  const labels = card.options.map((option) => option.label)
+  assert.ok(labels.includes('Продолжить'), 'the way to continue is offered')
+  assert.ok(labels.includes('Остановить taskloop'), 'the way to stop is offered')
+})
+
+test('the question names the number the fresh row carries, not the sent one', () => {
+  // The number is the second identity key (design D1): it is read off the row the
+  // file holds now, so a padded spelling stays exactly as the file writes it.
+  const card = buildDivergenceQuestion({
+    change: CHANGE,
+    previous: INCIDENT_ROW_SENT,
+    task: { ...ADJUDICATION_TASK, description: '02.1 Обновить README' },
+  })
+
+  assert.ok(card.question.includes('`02.1`'))
+  assert.ok(!card.question.includes('11.4'))
+})
+
+test('a divergence question without an old wording or a numbered row is refused', () => {
+  // A card that shows one wording, or cannot name the task it is about, would ask
+  // the user to decide on nothing; that is a caller's bug, not a question.
+  const previous = INCIDENT_ROW_SENT
+
+  assert.throws(() => buildDivergenceQuestion({ change: CHANGE, previous: '', task: ADJUDICATION_TASK }), /previous/u)
+  assert.throws(() => buildDivergenceQuestion({ change: CHANGE, previous: 42, task: ADJUDICATION_TASK }), /previous/u)
+  assert.throws(() => buildDivergenceQuestion({ change: CHANGE, previous, task: null }), /task object/u)
+  assert.throws(
+    () => buildDivergenceQuestion({ change: CHANGE, previous, task: { ...ADJUDICATION_TASK, description: '' } }),
+    /task description/u,
+  )
+  assert.throws(
+    () => buildDivergenceQuestion({ change: CHANGE, previous, task: { ...ADJUDICATION_TASK, description: 'Прогнать тесты' } }),
+    /task number/u,
+  )
+})
+
+/**
+ * A `ctx.userQuestions` stand-in that answers the divergence card with one selection.
+ *
+ * The service reports a selection by the labels it showed (it is how the bootstrap
+ * reads its consent), so a label list is the whole answer — and an empty list is the
+ * shape a card closed without a choice leaves behind.
+ *
+ * @param {string[]} selected - labels the fake person picked.
+ * @returns {{ask: (request: object) => Promise<object>}} the stand-in service.
+ */
+function selecting(selected) {
+  return {
+    async ask() {
+      return { answers: [{ id: DIVERGENCE_QUESTION_ID, selected }] }
+    },
+  }
+}
+
+test('the continue label sends the task again with the wording the file holds', async () => {
+  // Design D6: this answer is the only way a major divergence goes ahead, so the
+  // seam must show the card of task 4.1 and nothing else — one question, whose id
+  // and two wordings are what the answer is read against.
+  const asked = []
+  const questions = {
+    async ask(request) {
+      asked.push(request)
+      return { answers: [{ id: DIVERGENCE_QUESTION_ID, selected: [DIVERGENCE_LABEL.continue] }] }
+    },
+  }
+
+  const outcome = await requestContinuation({
+    questions,
+    change: CHANGE,
+    previous: INCIDENT_ROW_SENT,
+    task: MAJOR_TASK,
+  })
+
+  assert.deepEqual(outcome, { kind: DIVERGENCE_ANSWER.continue })
+  assert.equal(asked.length, 1, 'the card is shown once')
+  assert.deepEqual(
+    asked[0].questions,
+    [buildDivergenceQuestion({ change: CHANGE, previous: INCIDENT_ROW_SENT, task: MAJOR_TASK })],
+  )
+})
+
+test('the stop label stops the run and sanctions nothing', async () => {
+  // The other half of design D6: the person looked at the two wordings and said no,
+  // so the task is not sent and the run ends with the reason the report names.
+  const outcome = await requestContinuation({
+    questions: selecting([DIVERGENCE_LABEL.stop]),
+    change: CHANGE,
+    previous: INCIDENT_ROW_SENT,
+    task: MAJOR_TASK,
+  })
+
+  assert.deepEqual(outcome, { kind: DIVERGENCE_ANSWER.stop })
+})
+
+test('a closed card and a broken-off question are stops, not consents', async () => {
+  // The spec's "Вопрос закрыт без ответа" scenario. A dismissal is a request that
+  // ended, and an aborted one cannot be answered at all; neither may be read as
+  // permission to run a task nobody agreed to.
+  const rejecting = (code) => ({
+    ask: async () => {
+      const error = new Error(code)
+      error.code = code
+      throw error
+    },
+  })
+
+  for (const code of ['ASK_CANCELLED', 'ASK_ABORTED']) {
+    const outcome = await requestContinuation({
+      questions: rejecting(code),
+      change: CHANGE,
+      previous: INCIDENT_ROW_SENT,
+      task: MAJOR_TASK,
+    })
+
+    assert.deepEqual(outcome, { kind: DIVERGENCE_ANSWER.stop }, `${code} stops the run`)
+  }
+})
+
+test('an answer that does not pick the continue label alone is a stop', async () => {
+  // Consent is one label on its own (task 4.2). A card that came back with no
+  // selection, with free text instead of a choice, with both labels, with an extra
+  // label it never offered, or with an entry for another question granted nothing, and
+  // continuing on any of them would send a task whose wording no person endorsed.
+  const answers = {
+    'no selection': selecting([]),
+    'free text': {
+      async ask() {
+        return { answers: [{ id: DIVERGENCE_QUESTION_ID, selected: [], custom: 'да, давай' }] }
+      },
+    },
+    'both labels': selecting([DIVERGENCE_LABEL.continue, DIVERGENCE_LABEL.stop]),
+    'continue and an unknown label': selecting([DIVERGENCE_LABEL.continue, 'Пропустить']),
+    'another question': {
+      async ask() {
+        return { answers: [{ id: 'some-other-card', selected: [DIVERGENCE_LABEL.continue] }] }
+      },
+    },
+  }
+
+  for (const [name, questions] of Object.entries(answers)) {
+    const outcome = await requestContinuation({
+      questions,
+      change: CHANGE,
+      previous: INCIDENT_ROW_SENT,
+      task: MAJOR_TASK,
+    })
+
+    assert.deepEqual(outcome, { kind: DIVERGENCE_ANSWER.stop }, name)
+  }
+})
+
+test('a deployment with no question channel stops instead of continuing', async () => {
+  // The spec's "Спросить некого" scenario, and design D6's headless answer: the run
+  // stops with a reason instead of running a task no person vouched for.
+  for (const questions of [undefined, null, {}]) {
+    const outcome = await requestContinuation({
+      questions,
+      change: CHANGE,
+      previous: INCIDENT_ROW_SENT,
+      task: MAJOR_TASK,
+    })
+
+    assert.deepEqual(outcome, { kind: DIVERGENCE_ANSWER.unavailable })
+  }
+})
+
+test('a channel with nobody behind it is unavailability, not a refusal', async () => {
+  // `NO_PROVIDER` is the service saying it has no answerer, which is the same
+  // headless deployment as an absent service — not a person saying no.
+  const questions = {
+    ask: async () => {
+      const error = new Error('no provider')
+      error.code = 'NO_PROVIDER'
+      throw error
+    },
+  }
+
+  const outcome = await requestContinuation({
+    questions,
+    change: CHANGE,
+    previous: INCIDENT_ROW_SENT,
+    task: MAJOR_TASK,
+  })
+
+  assert.deepEqual(outcome, { kind: DIVERGENCE_ANSWER.unavailable })
+})
+
+test('a question that fails for another reason is an error, not an answer', async () => {
+  // A broken service is neither consent nor refusal: reporting it as a stop would
+  // end a healthy run on a bug, and reporting it as a continuation would send a task
+  // nobody was asked about.
+  const questions = {
+    ask: async () => {
+      throw new Error('the question service is gone')
+    },
+  }
+
+  await assert.rejects(
+    () => requestContinuation({ questions, change: CHANGE, previous: INCIDENT_ROW_SENT, task: MAJOR_TASK }),
+    /the question service is gone/u,
+  )
+})
+
+test('a run stopped before the question asks nobody anything', async () => {
+  const controller = new AbortController()
+  controller.abort()
+  let asked = 0
+  const questions = {
+    async ask() {
+      asked += 1
+      return { answers: [{ id: DIVERGENCE_QUESTION_ID, selected: [DIVERGENCE_LABEL.continue] }] }
+    },
+  }
+
+  const outcome = await requestContinuation({
+    questions,
+    change: CHANGE,
+    previous: INCIDENT_ROW_SENT,
+    task: MAJOR_TASK,
+    signal: controller.signal,
+  })
+
+  assert.equal(asked, 0, 'nothing is shown for a run that already ended')
+  assert.deepEqual(outcome, { kind: DIVERGENCE_ANSWER.stop })
+})
+
+test('a question that cannot name the task is refused even with no channel', async () => {
+  // The card is built before the channel is looked at: an unnameable question is a
+  // caller's bug in every deployment, and reporting it as "no channel" would hide it
+  // in exactly the deployments that never see a card.
+  await assert.rejects(
+    () => requestContinuation({ change: CHANGE, previous: '', task: MAJOR_TASK }),
+    /previous/u,
+  )
+  await assert.rejects(
+    () => requestContinuation({ change: CHANGE, previous: INCIDENT_ROW_SENT, task: { ...MAJOR_TASK, description: 'Прогнать тесты' } }),
+    /task number/u,
   )
 })

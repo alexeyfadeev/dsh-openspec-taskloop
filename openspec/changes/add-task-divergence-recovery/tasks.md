@@ -19,9 +19,9 @@
 
 ## 4. Вопрос пользователю при значительном расхождении
 
-- [ ] 4.1 Добавить `buildDivergenceQuestion({change, previous, task})`: header `OpenSpec`, вопрос о продолжении задачи `N.M`, `detail` с `Было:` и `Стало:`, варианты `Продолжить` и `Остановить taskloop`; проверить: тест сравнивает карточку целиком и проверяет наличие обоих ярлыков
-- [ ] 4.2 Добавить `requestContinuation({questions, agent, change, previous, task, signal})` с исходами `continue` / `stop` / `unavailable`; проверить: тесты на выбранный `Продолжить`, на выбранный `Остановить taskloop`, на закрытую карточку и на отсутствие канала
-- [ ] 4.3 Подключить шов в `lib/environment.js` (`confirmDiverged` через `ctx.get('userQuestions')`) и пробросить его в `lib/control.js`; проверить: `node --test test/environment.test.mjs test/control.test.mjs` проходит, а тест без сервиса вопросов видит `unavailable`
+- [x] 4.1 Добавить `buildDivergenceQuestion({change, previous, task})`: header `OpenSpec`, вопрос о продолжении задачи `N.M`, `detail` с `Было:` и `Стало:`, варианты `Продолжить` и `Остановить taskloop`; проверить: тест сравнивает карточку целиком и проверяет наличие обоих ярлыков
+- [x] 4.2 Добавить `requestContinuation({questions, agent, change, previous, task, signal})` с исходами `continue` / `stop` / `unavailable`; проверить: тесты на выбранный `Продолжить`, на выбранный `Остановить taskloop`, на закрытую карточку и на отсутствие канала
+- [x] 4.3 Подключить шов в `lib/environment.js` (`confirmDiverged` через `ctx.get('userQuestions')`) и пробросить его в `lib/control.js`; проверить: `node --test test/environment.test.mjs test/control.test.mjs` проходит, а тест без сервиса вопросов видит `unavailable`
 
 ## 5. Лестница в цикле (`lib/loop.js`)
 
