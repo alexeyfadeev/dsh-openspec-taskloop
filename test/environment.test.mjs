@@ -16,7 +16,7 @@
 // line a refusal leaves behind, with the pause it did not undo.
 
 import assert from 'node:assert/strict'
-import { access, mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -26,7 +26,7 @@ import { COMMIT_END, runCommit } from '../lib/commit.js'
 import { ANCHOR_QUESTION_ID, BRANCH_QUESTION_ID } from '../lib/commit-input.js'
 import { COMMIT_MESSAGE_QUESTION_ID, COMMIT_TEXT } from '../lib/commit-text.js'
 import { resolveConfig } from '../lib/config.js'
-import { DIVERGENCE_ANSWER, DIVERGENCE_LABEL, DIVERGENCE_QUESTION_ID } from '../lib/diverged.js'
+import { ADJUDICATION_END, DIVERGENCE_ANSWER, DIVERGENCE_LABEL, DIVERGENCE_QUESTION_ID } from '../lib/diverged.js'
 import { createEnvironment, resolveCwd } from '../lib/environment.js'
 import {
   DESCRIPTION_QUESTION_ID,
@@ -247,6 +247,36 @@ test('the run signal ends the divergence card, not the request one', async () =>
 
   assert.equal(asked.length, 1)
   assert.equal(asked[0].signal, runSignal)
+})
+
+test('the adjudication turn goes to the session the run hands in, and its verdict is read from the file', async (t) => {
+  const dir = await temporaryHome(t)
+  const file = join(dir, 'tasks.md')
+  await writeFile(file, '- [x] 11.4 Переписать обработчик возврата\n', 'utf8')
+  const sent = []
+  const agent = {
+    id: 'agent-2',
+    followup(message) {
+      sent.push(message)
+    },
+    async whenIdle() {},
+  }
+  const environment = createEnvironment(fakeCtx({}), resolveConfig())
+  const invocation = { agent: { id: 'agent-1' } }
+
+  const outcome = await environment.adjudicate(invocation, {
+    agent,
+    change: 'demo',
+    previous: SENT_WORDING,
+    task: { ...DIVERGED_TASK, sourcePath: file },
+  })
+
+  // The turn lands in the session that received the task — a boundary may have moved the
+  // run there — and the verdict is the checkbox of the row, not the model's answer.
+  assert.deepEqual(outcome, { kind: ADJUDICATION_END.ticked })
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].content[0].text, new RegExp(`Было: ${SENT_WORDING}`))
+  assert.match(sent[0].content[0].text, /Стало: 11\.4 Переписать обработчик возврата/)
 })
 
 test('the explore follow-up goes to the invocation agent, once', () => {

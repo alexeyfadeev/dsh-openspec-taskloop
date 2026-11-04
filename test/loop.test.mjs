@@ -1,4 +1,4 @@
-// Tests for the task loop (tasks 4.2–4.3, 5.1): the wait between a message and the
+// Tests for the task loop (tasks 4.2–4.3, 5.1–5.4): the wait between a message and the
 // next reading, the two ways a run can end — the task is checked and the run
 // advances, or it is not and the run stops without sending anything else — the
 // stop that ends a run from outside, and the session handoff at a group boundary,
@@ -8,6 +8,16 @@
 // unchecked box of any other turn stops it as before (design D6 of the UI change). The same
 // tests pin the phase a pause may not cut short: a pause that lands while a finished group
 // is being reviewed and committed parks the run after that hook, not inside it (design D5).
+//
+// The ladder of the divergence change is pinned here from the loop's side (5.1–5.4): a row
+// whose wording drifted is looked up by number, the accepted drift replaces the identity the
+// run holds, and the two bands the plugin may not settle alone are driven by the seams it is
+// given — one adjudication turn for `gray`, a question alone for `major` — with the calls
+// counted, because "no turn was sent" is part of the contract (design D5, D6). The stops the
+// ladder can end with are pinned apart as well (5.3, 5.4): a row whose number is gone is
+// `gone`, the three ways of leaving a wording unvouched-for are one `diverged` kind told apart
+// by its `decision` (design D7), and a row the reading cannot identify at all is
+// `unidentified` with the refusal that made it so (design D10).
 //
 // The agent is scripted rather than real: `whenIdle()` resolves on demand, so the
 // tests can pin that the plugin reads `tasks.md` only *after* the turn went quiet
@@ -20,7 +30,8 @@ import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import { COMPACTION_END, ON_FAILURE } from '../lib/compaction.js'
-import { GROUP_END, LOOP_END, runLoop } from '../lib/loop.js'
+import { ADJUDICATION_END, DIVERGENCE, DIVERGENCE_ANSWER, DIVERGENCE_REFUSAL, classifyDivergence } from '../lib/diverged.js'
+import { DIVERGENCE_DECISION, GROUP_END, LOOP_END, runLoop } from '../lib/loop.js'
 import { RUN_PHASE, createRuns } from '../lib/runs.js'
 
 const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'apply')
@@ -119,6 +130,71 @@ function flatDocument() {
 function withoutLine(line) {
   const document = JSON.parse(fixture('ready.json'))
   document.tasks = document.tasks.filter((task) => task.line !== line)
+  return JSON.stringify(document)
+}
+
+/** Note a model appends to a row it also ticks: the incident's shape (design D4). */
+const NOTE = ' (примечание: резолвер вынесен в отдельный модуль)'
+
+/**
+ * A document with one row's wording edited, as `tasks.md` reads after the model
+ * reworded the row it was given.
+ *
+ * The appended note keeps the sent text intact, which is the `minor` drift of the
+ * incident: the row is still the same task, and the run has to accept it.
+ *
+ * @param {string} text - document to edit.
+ * @param {number} line - row to reword.
+ * @param {string} [note] - text appended to that row.
+ * @returns {string} JSON text of the edited document.
+ */
+function reworded(text, line, note = NOTE) {
+  const document = JSON.parse(text)
+  document.tasks.find((task) => task.line === line).description += note
+  return JSON.stringify(document)
+}
+
+/**
+ * The same edit with a line inserted above the row, as `tasks.md` reads when the
+ * model also wrote something above the task it reworded.
+ *
+ * @param {string} text - document to edit.
+ * @param {number} line - row to reword, in the reading before the insertion.
+ * @param {string} [note] - text appended to that row.
+ * @returns {string} JSON text of the edited document.
+ */
+function rewordedBelow(text, line, note = NOTE) {
+  const document = JSON.parse(text)
+  for (const task of document.tasks) {
+    if (task.line >= line) task.line += 1
+    if (task.line === line + 1) task.description += note
+  }
+  return JSON.stringify(document)
+}
+
+/** The wording task 2.3 carries in the captured document, as the run sends it. */
+const SENT_2_3 = '2.3 Реализовать разбор `openspec instructions apply --json` и выбор первой '
+  + 'невыполненной задачи; проверить тестами состояния `ready`, `blocked` и `all_done`'
+
+/** Row 2.3 with its opening rewritten and its tail kept: the uncertain band (design D5). */
+const GRAY_2_3 = '2.3 Разобрать JSON-вывод `openspec instructions apply` и выбрать первую '
+  + 'невыполненную задачу; проверить тестами состояния `ready`, `blocked` и `all_done`'
+
+/** Row 2.3 replaced by an unrelated task under the same number: the major band (design D6). */
+const MAJOR_2_3 = '2.3 Обновить README и раздел про настройки'
+
+/**
+ * A document with one row's wording replaced wholesale, as `tasks.md` reads when the
+ * model rewrote the row it was given rather than appending to it.
+ *
+ * @param {string} text - document to edit.
+ * @param {number} line - row to rewrite.
+ * @param {string} description - the wording that row now carries.
+ * @returns {string} JSON text of the edited document.
+ */
+function renamed(text, line, description) {
+  const document = JSON.parse(text)
+  document.tasks.find((task) => task.line === line).description = description
   return JSON.stringify(document)
 }
 
@@ -369,17 +445,431 @@ test('a change blocked after a turn stops before the next task', async () => {
   assert.equal(cli.calls.length, 2)
 })
 
-test('a task that disappears from the file stops the run instead of guessing', async () => {
-  const { loop } = harness([
+test('a task whose row is gone from the file stops the run as `gone`', async () => {
+  // Design D7: the number is the second key, and it found nothing in the file the task came
+  // from — the row was deleted, not reworded. With no second wording there is nothing to
+  // classify, so the stop is named after what is missing rather than after a drift.
+  const sentRow = JSON.parse(fixture('ready.json')).tasks.find((task) => task.line === 12)
+  const { cli, loop } = harness([
     cliResult(fixture('ready.json')),
     cliResult(withoutLine(12)),
   ])
 
   const outcome = await loop()
 
-  assert.equal(outcome.kind, LOOP_END.missing)
+  assert.equal(outcome.kind, LOOP_END.gone)
+  // Neither a decision nor a band belongs to this stop: nobody was asked and nothing was compared.
+  assert.equal('decision' in outcome, false)
+  assert.equal('divergence' in outcome, false)
+  // The report names the row where it was sent, which is what the user has to go looking for.
+  assert.equal(outcome.task.line, 12)
+  assert.equal(outcome.task.sourcePath, sentRow.sourcePath)
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12])
+  assert.equal(cli.calls.length, 2)
+})
+
+test('a reworded row in a flat list stops as `unidentified` with `number-missing`', async () => {
+  // Design D10 and the spec's «Задача без номера»: a flat row has no second key, so a reworded
+  // one can be told neither from the task that was sent nor from a replacement. The stop says
+  // that — not `gone`, which claims the row was removed while it is still in the file — and it
+  // asks nobody: there is no band to settle, because nothing could be compared.
+  const adjudicated = []
+  const asked = []
+  const flat = flatDocument()
+  const edited = renamed(flat, 12, 'Разобрать вывод CLI и выбрать первую невыполненную задачу')
+  const { cli, messages, loop } = harness([
+    cliResult(flat),
+    cliResult(edited),
+  ])
+
+  const outcome = await loop({
+    adjudicate: async (context) => {
+      adjudicated.push(context)
+      return { kind: ADJUDICATION_END.untouched }
+    },
+    confirmDiverged: async (context) => {
+      asked.push(context)
+      return { kind: DIVERGENCE_ANSWER.continue }
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.unidentified)
+  // The reason names the key the reading lacked, which is what makes the stop actionable.
+  assert.equal(outcome.reason, DIVERGENCE_REFUSAL.numberMissing)
+  // Nobody decided anything and no band was measured, so neither field belongs to this stop.
+  assert.equal('decision' in outcome, false)
+  assert.equal('divergence' in outcome, false)
+  // The row is named where it was sent: without a number, that address is all the user has.
   assert.equal(outcome.task.line, 12)
   assert.deepEqual(outcome.sent.map((task) => task.line), [12])
+  assert.equal(messages.length, 1)
+  assert.equal(adjudicated.length, 0)
+  assert.equal(asked.length, 0)
+  assert.equal(cli.calls.length, 2)
+})
+
+test('a numbered row left with nothing but its number stops as `unidentified` too', async () => {
+  // The same impossibility from the other side (design D10): the number was found, and the row
+  // says nothing else, so no band may be measured. The reason travels with the stop rather than
+  // collapsing into the flat list's, because the report names them apart (task 6.1).
+  const { cli, messages, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(renamed(fixture('ready.json'), 12, '2.3')),
+  ])
+
+  const outcome = await loop()
+
+  assert.equal(outcome.kind, LOOP_END.unidentified)
+  assert.equal(outcome.reason, DIVERGENCE_REFUSAL.emptyText)
+  assert.equal('decision' in outcome, false)
+  assert.equal('divergence' in outcome, false)
+  assert.equal(outcome.task.line, 12)
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12])
+  assert.equal(messages.length, 1)
+  assert.equal(cli.calls.length, 2)
+})
+
+test('a ticked task with an appended note is accepted and the run moves on', async () => {
+  // The incident's shape (design D4): the model ticked 2.3 and rewrote its text, so the
+  // verbatim triple misses. The sent wording survived inside the new one, which is a
+  // minor drift: the run reads the new row as the same task and continues to 2.4.
+  const { cli, messages, events, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(reworded(progressedDocument(), 12)),
+    cliResult(progressedDocument()),
+  ])
+
+  const outcome = await loop()
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12, 13])
+  assert.deepEqual(messages.map(labelOf), ['2.3', '2.4'])
+  assert.deepEqual(events, [
+    'read',
+    'followup 2.3',
+    'idle',
+    'read',
+    'followup 2.4',
+    'idle',
+    'read',
+  ])
+  assert.equal(cli.calls.length, 3)
+})
+
+test('an accepted wording on an unchecked row is sent again with the new text', async () => {
+  // The model reworded 2.3, left it unchecked and pushed it down a line. The accepted row
+  // replaces the run's position (design D4), so the task goes out again — at its new line
+  // and with the wording the file now holds — instead of stopping as unmarked.
+  const edited = rewordedBelow(fixture('ready.json'), 12)
+  const moved = JSON.parse(edited).tasks.find((task) => task.line === 13)
+  const { cli, messages, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(edited),
+    cliResult(edited),
+  ])
+
+  const outcome = await loop()
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12, 13])
+  assert.deepEqual(messages.map(labelOf), ['2.3', '2.3'])
+  assert.equal(outcome.sent[1].description, moved.description)
+  assert.equal(outcome.sent[1].line, 13)
+  assert.equal(cli.calls.length, 3)
+})
+
+test('the rows the ladder tests use fall in the bands they claim', () => {
+  // The precondition of the tests below: the appended-note row is `minor`, the rewritten one
+  // is `gray` and the replaced one is `major`. Pinning it here means a change of thresholds
+  // cannot quietly move a case out of the band whose branch the test is meant to exercise.
+  const row = JSON.parse(fixture('ready.json')).tasks.find((task) => task.line === 12)
+
+  assert.equal(row.description, SENT_2_3)
+  assert.equal(classifyDivergence(SENT_2_3, GRAY_2_3).kind, DIVERGENCE.gray)
+  assert.equal(classifyDivergence(SENT_2_3, MAJOR_2_3).kind, DIVERGENCE.major)
+})
+
+test('an uncertain divergence the model ticks is taken as the same task', async () => {
+  // Design D5: the gray band gets exactly one turn, and its verdict is read off the row's
+  // checkbox — so the run adopts the wording the model confirmed and moves on to 2.4.
+  const adjudicated = []
+  const asked = []
+  const grayUnchecked = renamed(fixture('ready.json'), 12, GRAY_2_3)
+  const grayTicked = renamed(tickedDocument([12]), 12, GRAY_2_3)
+  const { agent, cli, messages, events, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(grayUnchecked),
+    cliResult(grayTicked),
+    cliResult(grayTicked),
+  ])
+
+  const outcome = await loop({
+    adjudicate: async (context) => {
+      adjudicated.push(context)
+      return { kind: ADJUDICATION_END.ticked }
+    },
+    confirmDiverged: async (context) => {
+      asked.push(context)
+      return { kind: DIVERGENCE_ANSWER.continue }
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12, 13])
+  assert.deepEqual(messages.map(labelOf), ['2.3', '2.4'])
+  // The turn names both wordings of the one row and the recipient that received it.
+  assert.equal(adjudicated.length, 1)
+  assert.equal(adjudicated[0].change, CHANGE)
+  assert.equal(adjudicated[0].agent, agent)
+  assert.equal(adjudicated[0].previous, SENT_2_3)
+  assert.equal(adjudicated[0].task.description, GRAY_2_3)
+  assert.equal(asked.length, 0, 'a ticked row is the verdict, so nobody is asked')
+  // The turn is followed by a reading of the file rather than by the verdict itself: only a
+  // checkbox in `tasks.md` may declare a task done.
+  assert.deepEqual(events, [
+    'read',
+    'followup 2.3',
+    'idle',
+    'read',
+    'read',
+    'followup 2.4',
+    'idle',
+    'read',
+  ])
+  assert.equal(cli.calls.length, 4)
+})
+
+test('an uncertain divergence the model leaves alone asks the user, who sends it again', async () => {
+  // Design D5: an untouched row means the same task is unproven, so the question of design D6
+  // is asked. `Продолжить` sends the task again with the wording the file now holds.
+  const adjudicated = []
+  const asked = []
+  const gray = renamed(fixture('ready.json'), 12, GRAY_2_3)
+  const { cli, messages, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(gray),
+    cliResult(gray),
+  ])
+
+  const outcome = await loop({
+    adjudicate: async (context) => {
+      adjudicated.push(context)
+      return { kind: ADJUDICATION_END.untouched }
+    },
+    confirmDiverged: async (context) => {
+      asked.push(context)
+      return { kind: DIVERGENCE_ANSWER.continue }
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12, 12])
+  assert.deepEqual(messages.map(labelOf), ['2.3', '2.3'])
+  // The re-sent task carries the wording the file holds, not the one that was sent first:
+  // an adopted wording replaces the identity the run compares against.
+  assert.equal(outcome.sent[1].description, GRAY_2_3)
+  assert.equal(adjudicated.length, 1)
+  assert.equal(asked.length, 1)
+  assert.equal(asked[0].previous, SENT_2_3)
+  assert.equal(asked[0].task.description, GRAY_2_3)
+  assert.equal(cli.calls.length, 3)
+})
+
+test('an uncertain divergence on a ticked row asks the user without a turn', async () => {
+  // Design D5: the work is done and there is no verdict left to observe, so the model is not
+  // asked at all. The question decides whether the ticked row is the task that was sent.
+  const adjudicated = []
+  const asked = []
+  const grayTicked = renamed(tickedDocument([12]), 12, GRAY_2_3)
+  const { cli, messages, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(grayTicked),
+    cliResult(grayTicked),
+  ])
+
+  const outcome = await loop({
+    adjudicate: async (context) => {
+      adjudicated.push(context)
+      return { kind: ADJUDICATION_END.ticked }
+    },
+    confirmDiverged: async (context) => {
+      asked.push(context)
+      return { kind: DIVERGENCE_ANSWER.continue }
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12, 13])
+  assert.deepEqual(messages.map(labelOf), ['2.3', '2.4'])
+  assert.equal(adjudicated.length, 0, 'a ticked row is not worth an adjudication turn')
+  assert.equal(asked.length, 1)
+  assert.equal(asked[0].task.done, true)
+  assert.equal(cli.calls.length, 3)
+})
+
+test('a significant divergence asks the user without a turn', async () => {
+  // Design D6: a wording with almost nothing in common with the one that was sent is nobody's
+  // call but the user's, and the model is not asked — the gray band's turn settles
+  // uncertainty, it does not grant a rewrite.
+  const adjudicated = []
+  const asked = []
+  const major = renamed(fixture('ready.json'), 12, MAJOR_2_3)
+  const { cli, messages, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(major),
+    cliResult(major),
+  ])
+
+  const outcome = await loop({
+    adjudicate: async (context) => {
+      adjudicated.push(context)
+      return { kind: ADJUDICATION_END.ticked }
+    },
+    confirmDiverged: async (context) => {
+      asked.push(context)
+      return { kind: DIVERGENCE_ANSWER.continue }
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.unmarked)
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12, 12])
+  assert.deepEqual(messages.map(labelOf), ['2.3', '2.3'])
+  assert.equal(outcome.sent[1].description, MAJOR_2_3)
+  assert.equal(adjudicated.length, 0, 'the significant band gets no turn')
+  assert.equal(asked.length, 1)
+  assert.equal(asked[0].task.description, MAJOR_2_3)
+  assert.equal(cli.calls.length, 3)
+})
+
+test('a user who declines the question ends the run as `diverged` with `declined`', async () => {
+  // Design D6/D7: `Остановить taskloop` — and a closed card, which the question service reports
+  // as the same answer — leaves the wording unvouched-for. The task is not sent, and the stop
+  // says which of the ways it ended: a person said no.
+  const asked = []
+  const major = renamed(fixture('ready.json'), 12, MAJOR_2_3)
+  const { cli, messages, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(major),
+  ])
+
+  const outcome = await loop({
+    confirmDiverged: async (context) => {
+      asked.push(context)
+      return { kind: DIVERGENCE_ANSWER.stop }
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.diverged)
+  assert.equal(outcome.decision, DIVERGENCE_DECISION.declined)
+  // The band travels with the decision, so the report can name how far the wording drifted.
+  assert.equal(outcome.divergence, DIVERGENCE.major)
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12])
+  assert.equal(outcome.task.line, 12)
+  assert.equal(messages.length, 1, 'a wording nobody vouched for is not sent again')
+  assert.equal(asked.length, 1)
+  assert.equal(cli.calls.length, 2)
+})
+
+test('a stop that lands while the question is open ends the run as cancelled', async () => {
+  // `/taskloop stop` aborts the run's signal, and the card is asked with that signal, so the
+  // question service reports a dismissal rather than an answer (4.2). That must not be read as
+  // a person declining the wording (5.3): the run was stopped, and the stop wins over whatever
+  // the card was about — the same way it wins over a completed turn, a review and a compaction.
+  const controller = new AbortController()
+  const major = renamed(fixture('ready.json'), 12, MAJOR_2_3)
+  const { messages, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(major),
+  ])
+
+  const outcome = await loop({
+    signal: controller.signal,
+    confirmDiverged: async () => {
+      controller.abort()
+      return { kind: DIVERGENCE_ANSWER.stop }
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.cancelled)
+  // Nothing decided the wording, because nobody was left to decide it.
+  assert.equal('decision' in outcome, false)
+  assert.equal('divergence' in outcome, false)
+  assert.equal(messages.length, 1, 'a stopped run sends nothing after the card')
+})
+
+test('a deployment nobody can ask ends the run as `diverged` with `no-channel`', async () => {
+  // The same place in the ladder, told apart by design D7: the question reports that this
+  // deployment has no channel (task 4.2), so nobody declined — there was nobody to decline.
+  const major = renamed(fixture('ready.json'), 12, MAJOR_2_3)
+  const { messages, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(major),
+  ])
+
+  const outcome = await loop({
+    confirmDiverged: async () => ({ kind: DIVERGENCE_ANSWER.unavailable }),
+  })
+
+  assert.equal(outcome.kind, LOOP_END.diverged)
+  assert.equal(outcome.decision, DIVERGENCE_DECISION.noChannel)
+  assert.equal(outcome.divergence, DIVERGENCE.major)
+  assert.equal(messages.length, 1)
+})
+
+test('a run with no seam to ask through stops as `diverged` with `no-channel`', async () => {
+  // Design D8: both seams are optional and either absence is a stop rather than a guess. Two
+  // absences meet the same decision, because in both the band needs an answer the deployment
+  // cannot obtain: a significant row nobody was asked about, and an uncertain row with no turn
+  // to settle it.
+  const major = renamed(fixture('ready.json'), 12, MAJOR_2_3)
+  const significant = harness([cliResult(fixture('ready.json')), cliResult(major)])
+  const withoutQuestion = await significant.loop()
+
+  assert.equal(withoutQuestion.kind, LOOP_END.diverged)
+  assert.equal(withoutQuestion.decision, DIVERGENCE_DECISION.noChannel)
+  assert.equal(withoutQuestion.divergence, DIVERGENCE.major)
+
+  const gray = renamed(fixture('ready.json'), 12, GRAY_2_3)
+  const uncertain = harness([cliResult(fixture('ready.json')), cliResult(gray)])
+  const withoutTurn = await uncertain.loop()
+
+  assert.equal(withoutTurn.kind, LOOP_END.diverged)
+  assert.equal(withoutTurn.decision, DIVERGENCE_DECISION.noChannel)
+  assert.equal(withoutTurn.divergence, DIVERGENCE.gray)
+  assert.equal(uncertain.messages.length, 1, 'neither a task nor a turn is sent')
+})
+
+test('a ticked row under a replaced wording stops as `diverged` with `already-done`', async () => {
+  // Design D7: the work happened, but under a wording nobody recognises, so nothing is left to
+  // send and nothing is asked — not the model (5.2), and not the user, who could only answer a
+  // question about a task that is already performed.
+  const adjudicated = []
+  const asked = []
+  const tickedMajor = renamed(tickedDocument([12]), 12, MAJOR_2_3)
+  const { cli, messages, loop } = harness([
+    cliResult(fixture('ready.json')),
+    cliResult(tickedMajor),
+  ])
+
+  const outcome = await loop({
+    adjudicate: async (context) => {
+      adjudicated.push(context)
+      return { kind: ADJUDICATION_END.ticked }
+    },
+    confirmDiverged: async (context) => {
+      asked.push(context)
+      return { kind: DIVERGENCE_ANSWER.continue }
+    },
+  })
+
+  assert.equal(outcome.kind, LOOP_END.diverged)
+  assert.equal(outcome.decision, DIVERGENCE_DECISION.alreadyDone)
+  assert.equal(outcome.divergence, DIVERGENCE.major)
+  assert.deepEqual(outcome.sent.map((task) => task.line), [12])
+  assert.equal(messages.length, 1)
+  assert.equal(adjudicated.length, 0, 'the significant band gets no turn')
+  assert.equal(asked.length, 0, 'a ticked row leaves nothing to ask about')
+  assert.equal(cli.calls.length, 2)
 })
 
 test('an agent without whenIdle is refused before anything is read or sent', async () => {
