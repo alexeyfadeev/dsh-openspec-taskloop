@@ -41,6 +41,45 @@ One task per turn. The plugin sends the task message, waits for the turn it star
 task and the file. Nothing else moves the run forward — an argument the command does not understand answers with
 the usage text and sends nothing.
 
+A task is recognised between turns by where it was sent and by its exact wording — the same file, the same line,
+the same text. When that triple no longer matches, the run looks for the same `N.M` in the file the task came
+from — preferring the nearest line — and takes the row it finds as the task it sent: a line inserted above a
+task, or a note appended to its row, no longer ends the run as if the task had vanished. A number that is gone
+from that file is a different answer: the row was deleted or moved out of the list, and the report says so,
+naming the task and the line it was sent from.
+
+The wording of the row that was found back is then compared with the wording that was sent — by the plugin alone,
+deterministically, and without asking the model. The number has already been matched, so the comparison drops it,
+folds whitespace and case, and asks two questions in order. The old text surviving whole inside the new one is the
+commonest drift there is — the model ticked `11.4` and appended a note to it — and is accepted as the same task
+however much longer the row became. Otherwise character-level similarity decides: 0.90 and above is the same task
+with a correction, from 0.60 up to 0.90 is too close to call, and below 0.60 the row has too little in common to
+be the task that was sent. Both thresholds are constants of the algorithm, not settings, so nothing on the
+settings page tunes them. A rewrite that touches the number itself is not a drift to weigh: the row is no longer
+listed under the number that was sent, so the run stops as it does for a deleted row. A row left with nothing but
+its number has no wording left to compare, and stops saying exactly that. A flat list without `N.M` ids has no
+number key at all, so a reworded row there stops the run the way it always did, with the report naming the key it
+lacks.
+
+Each band has one way forward. A minor drift is accepted: a ticked row closes its group and the run continues with
+the next task, an unchecked one goes out again with the wording the file now holds, and the report adds
+`The wording of task 2.3 changed and was accepted (minor drift); the run continued with it.` The uncertain band is
+worth exactly one turn to the model — both wordings, and the rule that ticks the box if it is the same task and
+leaves the row alone if it is not — and the verdict is read from that checkbox rather than from the answer: a
+ticked row continues the run, an untouched one hands the question to you. The card appears without that turn when
+the row is already ticked, because there is no verdict left to observe, and the significant band skips the turn
+altogether: a wording with almost nothing in common with the one that was sent is nobody's call but yours — except
+that a ticked row under a replaced wording stops the run instead of asking, since the work happened under a
+wording the run cannot account for.
+
+The card is headed `OpenSpec`, asks ``Формулировка задачи `11.4` изменилась. Продолжить выполнение этой задачи?``,
+shows both wordings as `Было:` and `Стало:`, and offers two ways out: `Продолжить` sends the task with the wording
+the file now holds, `Остановить taskloop` ends the run. Closing the card is that stop, not a skip; a deployment with
+no question channel stops too, saying that nobody could be asked; and `/taskloop stop` while the card is open is
+the stop it is, reported as stopped rather than as a refusal. Each stop that turns on the wording names the task, the
+line it was sent from and how far the wording had drifted, so a wording nobody vouched for is never a task the run
+quietly ran.
+
 Task ids of the form `N.M` form **groups**. When the last task of a group is verified, the run continues in a
 session it opens itself, and the report in the original session says which one — unless **Stop at each task group
 boundary** makes that boundary the end of the run instead, as described below. A flat list (no `N.M` ids) has no groups
