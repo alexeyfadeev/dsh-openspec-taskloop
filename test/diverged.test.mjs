@@ -1,7 +1,9 @@
-// Tests for divergence classification (tasks 1.1–1.4): the normalisation every
-// later comparison is built on, the containment rule that decides the incident,
-// the edit distance whose similarity places a drift in one of three bands, and
-// the classifier that orders those steps and refuses the pairs it cannot judge.
+// Tests for divergence classification (tasks 1.1–1.4), the adjudication prompt
+// (task 3.1) and the adjudication turn itself (task 3.2): the normalisation every
+// later comparison is built on, the containment rule that decides the incident, the
+// edit distance whose similarity places a drift in one of three bands, the
+// classifier that orders those steps and refuses the pairs it cannot judge, the one
+// turn a gray divergence is worth, and the verdict that turn is read through.
 //
 // The 11.4 row is the one from docs/taskloop-missing-stop-2026-11-03.md. That
 // report keeps the shape of the row rather than its exact words — the incident
@@ -10,22 +12,34 @@
 // and fixed the typo `расрешiver` → `резолвер` inside it. Normalisation does not
 // read the words, so any spelling of that shape exercises the same code, and the
 // reconstruction keeps the test readable next to the report.
+//
+// The turn of task 3.2 is driven by fakes: an agent whose `followup()` edits a
+// tracking file of the test's own, because the verdict is read from the checkbox
+// and no test may tick a row of this repository's list.
 
 import assert from 'node:assert/strict'
+import { writeFileSync } from 'node:fs'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
 
 import {
+  ADJUDICATION_END,
   DIVERGENCE,
   DIVERGENCE_REFUSAL,
   SIMILARITY_GRAY,
   SIMILARITY_MINOR,
+  buildAdjudicationPrompt,
   classifyByContainment,
   classifyBySimilarity,
   classifyDivergence,
   levenshteinDistance,
   normalizeDescription,
+  runAdjudication,
   similarityRatio,
 } from '../lib/diverged.js'
+import { APPLY_SKILL_PATH } from '../lib/step.js'
 
 /** Row 11.4 as the model was given it, before the turn edited the text. */
 const INCIDENT_ROW_SENT = '11.4 Реализовать резолвер корректировки доставки и отправку события в шину; '
@@ -54,6 +68,20 @@ const INCIDENT_ROW_REWRITTEN = '11.4 Переписать резолвер ко�
 
 /** Row 11.4 replaced by an unrelated task under the same number: the major band. */
 const INCIDENT_ROW_REPLACEMENT = '11.4 Обновить README и раздел про настройки'
+
+const CHANGE = 'add-task-divergence-recovery'
+
+/** Tracking file the sent row came from, as `openspec instructions apply` reports it. */
+const SOURCE = 'C:\\work\\_dsh\\dsh-openspec-taskloop\\openspec\\changes\\add-task-divergence-recovery\\tasks.md'
+
+/** The row a gray divergence would hand to one adjudication turn (tasks 3.1–3.2). */
+const ADJUDICATION_TASK = {
+  id: '7',
+  description: INCIDENT_ROW_AFTER,
+  done: false,
+  sourcePath: SOURCE,
+  line: 61,
+}
 
 
 test('the incident row 11.4 loses its number and keeps its wording', () => {
@@ -349,4 +377,321 @@ test('the bands are pinned to the thresholds the design fixes', () => {
   assert.equal(SIMILARITY_MINOR, 0.90)
   assert.equal(SIMILARITY_GRAY, 0.60)
   assert.ok(SIMILARITY_GRAY < SIMILARITY_MINOR)
+})
+
+test('the adjudication prompt names both wordings, the rule and the pause', () => {
+  // Design D5 / task 3.1: the wording is a behavioural contract, so it is pinned
+  // whole. The model has to see what it was given, what the row now says, what to
+  // do in either case, and that the turn ends there.
+  assert.equal(
+    buildAdjudicationPrompt({ change: CHANGE, previous: INCIDENT_ROW_SENT, task: ADJUDICATION_TASK }),
+    [
+      `Используя навык ${APPLY_SKILL_PATH}, проверь, та же ли это задача, что была отправлена, далее - пауза.`,
+      `Было: ${INCIDENT_ROW_SENT}`,
+      `Стало: ${INCIDENT_ROW_AFTER}`,
+      'Если это та же задача — выполни её и отметь чекбокс; если другая — не трогай строку.',
+      `Change: ${CHANGE}; файл: ${SOURCE}:61.`,
+    ].join('\n'),
+  )
+})
+
+test('both formulations reach the model verbatim, not normalised', () => {
+  // The normalisation of task 1.1 exists for the plugin's own comparison; showing
+  // the model a folded text instead of the row would leave it comparing nothing it
+  // recognises. The pause is part of the instruction, so it must be present even
+  // though the run is what continues afterwards.
+  const text = buildAdjudicationPrompt({ change: CHANGE, previous: INCIDENT_ROW_SENT, task: ADJUDICATION_TASK })
+
+  assert.ok(text.includes(`Было: ${INCIDENT_ROW_SENT}`))
+  assert.ok(text.includes(`Стало: ${INCIDENT_ROW_AFTER}`))
+  assert.ok(text.includes('далее - пауза'), 'the turn must end where the task ends')
+})
+
+test('the skill path is a parameter, so a caller can point the turn elsewhere', () => {
+  const text = buildAdjudicationPrompt({
+    change: CHANGE,
+    previous: INCIDENT_ROW_SENT,
+    task: ADJUDICATION_TASK,
+    skillPath: '.dsh/skills/other',
+  })
+
+  assert.ok(text.includes('Используя навык .dsh/skills/other,'))
+  assert.ok(!text.includes(APPLY_SKILL_PATH))
+})
+
+test('an adjudication prompt without a change, an old wording or an address is refused', () => {
+  // A half-addressed turn would ask the model to compare nothing or tick a row it
+  // cannot find, which is worse than not asking at all.
+  const previous = INCIDENT_ROW_SENT
+
+  assert.throws(() => buildAdjudicationPrompt({ change: '', previous, task: ADJUDICATION_TASK }), /change name/)
+  assert.throws(() => buildAdjudicationPrompt({ change: CHANGE, previous: '', task: ADJUDICATION_TASK }), /previous/)
+  assert.throws(() => buildAdjudicationPrompt({ change: CHANGE, previous: 42, task: ADJUDICATION_TASK }), /previous/)
+  assert.throws(() => buildAdjudicationPrompt({ change: CHANGE, previous, task: null }), /task object/)
+
+  for (const task of [
+    { ...ADJUDICATION_TASK, description: '' },
+    { ...ADJUDICATION_TASK, sourcePath: '' },
+    { ...ADJUDICATION_TASK, line: 0 },
+  ]) {
+    assert.throws(() => buildAdjudicationPrompt({ change: CHANGE, previous, task }), TypeError)
+  }
+})
+
+/** The fake tracking file around row 11.4, as the adjudication turn found it. */
+const ROWS_BEFORE = [
+  '# Tasks',
+  '',
+  '## 11. Гарантия отправки события корректировки',
+  `- [ ] ${INCIDENT_ROW_SENT}`,
+  '- [ ] 11.5 Прогнать полный набор тестов',
+]
+
+/** The same file after the turn did the task and ticked its row. */
+const ROWS_AFTER = [
+  '# Tasks',
+  '',
+  '## 11. Гарантия отправки события корректировки',
+  `- [x] ${INCIDENT_ROW_AFTER}`,
+  '- [ ] 11.5 Прогнать полный набор тестов',
+]
+
+/**
+ * A tracking file of the test's own, holding these rows.
+ *
+ * A fake file rather than this repository's `tasks.md`: the verdict is read from the
+ * checkbox, so the row the turn is asked about is the row a test would have to tick,
+ * and no test may tick a real one.
+ *
+ * @param {object} t - test context, which owns the cleanup.
+ * @param {string[]} rows - lines of the fake tracking file.
+ * @returns {Promise<string>} absolute path of the file.
+ */
+async function trackingFile(t, rows) {
+  const directory = await mkdtemp(join(tmpdir(), 'openspec-taskloop-diverged-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const path = join(directory, 'tasks.md')
+  await writeFile(path, `${rows.join('\n')}\n`, 'utf8')
+  return path
+}
+
+/**
+ * Row 11.4 of a fake tracking file, as the fresh reading would report it.
+ *
+ * @param {string} sourcePath - the fake file the row lives in.
+ * @param {number} [line] - the line the row was on in that reading.
+ * @returns {import('../lib/tasks.js').ApplyTask} the task a gray divergence hands to
+ *   the adjudication turn.
+ */
+function grayTask(sourcePath, line = 4) {
+  return { ...ADJUDICATION_TASK, sourcePath, line }
+}
+
+/**
+ * Let every already-resolved promise run before the test looks at the fakes.
+ *
+ * @returns {Promise<void>} resolves after the next macrotask.
+ */
+const settle = () => new Promise((resolve) => setImmediate(resolve))
+
+test('a turn that ticks the row reports the task as taken', async (t) => {
+  const path = await trackingFile(t, ROWS_BEFORE)
+  const task = grayTask(path)
+  const sent = []
+  const agent = {
+    followup(message) {
+      sent.push(message)
+      // What the message asks for: perform the task, then tick its row. The note and
+      // the fixed typo are the model's; the checkbox is the verdict.
+      writeFileSync(path, `${ROWS_AFTER.join('\n')}\n`, 'utf8')
+    },
+    async whenIdle() {},
+  }
+
+  const outcome = await runAdjudication({ agent, change: CHANGE, previous: INCIDENT_ROW_SENT, task })
+
+  assert.deepEqual(outcome, { kind: ADJUDICATION_END.ticked })
+  // Exactly one turn (design D5), and it is the plain user message of task 3.1: the
+  // session log is where the user reads what the model was asked.
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].role, 'user')
+  assert.equal(sent[0].source.kind, 'user')
+  assert.equal(
+    sent[0].content[0].text,
+    buildAdjudicationPrompt({ change: CHANGE, previous: INCIDENT_ROW_SENT, task }),
+  )
+})
+
+test('a turn that leaves the row alone reports the task as unproven', async (t) => {
+  const path = await trackingFile(t, ROWS_BEFORE)
+  const sent = []
+  const agent = {
+    followup(message) {
+      sent.push(message)
+    },
+    async whenIdle() {},
+  }
+
+  const outcome = await runAdjudication({ agent, change: CHANGE, previous: INCIDENT_ROW_SENT, task: grayTask(path) })
+
+  // Design D5: the model's answer is never read, so "could not do it" and "it is
+  // another task" are one verdict — and both hand the decision to the user.
+  assert.deepEqual(outcome, { kind: ADJUDICATION_END.untouched })
+  assert.equal(sent.length, 1)
+})
+
+test('the verdict follows the row number, not the line the turn was told to tick', async (t) => {
+  // The model inserted a line above the row while it worked, so row 11.4 is no longer
+  // at the line the message named — and that line now holds another task, unticked.
+  // Reading the address would report the sent task as unproven; reading the number
+  // finds the row the model actually ticked.
+  const path = await trackingFile(t, [
+    '# Tasks',
+    '',
+    `- [ ] 11.3 ${INCIDENT_ROW_SENT}`,
+    'Заметка, которую модель дописала по ходу работы.',
+    `- [x] ${INCIDENT_ROW_AFTER}`,
+    '- [ ] 11.5 Прогнать полный набор тестов',
+  ])
+  const agent = { followup() {}, async whenIdle() {} }
+
+  const outcome = await runAdjudication({
+    agent,
+    change: CHANGE,
+    previous: INCIDENT_ROW_SENT,
+    task: grayTask(path, 3),
+  })
+
+  assert.deepEqual(outcome, { kind: ADJUDICATION_END.ticked })
+})
+
+test('a ticked neighbour at the addressed line is not the verdict', async (t) => {
+  // The mirror case, and the unsafe one: another task's ticked box sits at the line
+  // the message named, while row 11.4 moved down untouched. Reading the address
+  // would continue a run on the strength of someone else's checkbox.
+  const path = await trackingFile(t, [
+    '# Tasks',
+    '',
+    'Заметка, которую модель дописала выше строки.',
+    `- [x] 11.3 ${INCIDENT_ROW_SENT}`,
+    `- [ ] ${INCIDENT_ROW_AFTER}`,
+    '- [ ] 11.5 Прогнать полный набор тестов',
+  ])
+  const agent = { followup() {}, async whenIdle() {} }
+
+  const outcome = await runAdjudication({
+    agent,
+    change: CHANGE,
+    previous: INCIDENT_ROW_SENT,
+    task: grayTask(path, 4),
+  })
+
+  assert.deepEqual(outcome, { kind: ADJUDICATION_END.untouched })
+})
+
+test('a stop during the adjudication ends it as cancelled, not as a lost turn', async () => {
+  const controller = new AbortController()
+  let sent = 0
+  const agent = {
+    followup() {
+      sent += 1
+    },
+    // The turn never finishes: only the stop can end the wait.
+    whenIdle: () => new Promise(() => {}),
+  }
+
+  const pending = runAdjudication({
+    agent,
+    change: CHANGE,
+    previous: INCIDENT_ROW_SENT,
+    task: ADJUDICATION_TASK,
+    signal: controller.signal,
+  })
+
+  await settle()
+  // The message is the turn being interrupted, not one that never started.
+  assert.equal(sent, 1)
+  controller.abort()
+
+  assert.deepEqual(await pending, { kind: ADJUDICATION_END.cancelled })
+})
+
+test('a run stopped before the adjudication sends no turn and reads no verdict', async () => {
+  const controller = new AbortController()
+  controller.abort()
+  let sent = 0
+  const agent = {
+    followup() {
+      sent += 1
+    },
+    async whenIdle() {},
+  }
+
+  const outcome = await runAdjudication({
+    agent,
+    change: CHANGE,
+    previous: INCIDENT_ROW_SENT,
+    task: ADJUDICATION_TASK,
+    signal: controller.signal,
+  })
+
+  assert.equal(sent, 0)
+  assert.deepEqual(outcome, { kind: ADJUDICATION_END.cancelled })
+})
+
+test('a verdict that cannot be read leaves the task unproven', async (t) => {
+  const path = await trackingFile(t, ROWS_AFTER)
+  // The row was there a moment ago; a file that went away still proves nothing.
+  await rm(path)
+  const agent = { followup() {}, async whenIdle() {} }
+
+  const outcome = await runAdjudication({ agent, change: CHANGE, previous: INCIDENT_ROW_SENT, task: grayTask(path) })
+
+  assert.deepEqual(outcome, { kind: ADJUDICATION_END.untouched })
+})
+
+test('an adjudication needs a turn-capable agent and a complete question', async () => {
+  const sent = []
+  const agent = {
+    followup(message) {
+      sent.push(message)
+    },
+    async whenIdle() {},
+  }
+
+  // Neither half of the turn is optional: one message, then one wait.
+  await assert.rejects(
+    () => runAdjudication({ change: CHANGE, previous: INCIDENT_ROW_SENT, task: ADJUDICATION_TASK }),
+    /requires an agent/u,
+  )
+  await assert.rejects(
+    () => runAdjudication({ agent: { followup() {} }, change: CHANGE, previous: INCIDENT_ROW_SENT, task: ADJUDICATION_TASK }),
+    /requires an agent/u,
+  )
+
+  // A question that cannot name both wordings or the row is a caller's bug, and it
+  // must not reach a session.
+  await assert.rejects(
+    () => runAdjudication({ agent, change: '', previous: INCIDENT_ROW_SENT, task: ADJUDICATION_TASK }),
+    /change name/u,
+  )
+  await assert.rejects(
+    () => runAdjudication({ agent, change: CHANGE, previous: '', task: ADJUDICATION_TASK }),
+    /previous/u,
+  )
+
+  assert.equal(sent.length, 0)
+})
+
+test('a turn that fails to start is an error, not a stop', async (t) => {
+  const path = await trackingFile(t, ROWS_BEFORE)
+  const agent = {
+    followup() {},
+    whenIdle: () => Promise.reject(new Error('the agent is gone')),
+  }
+
+  await assert.rejects(
+    () => runAdjudication({ agent, change: CHANGE, previous: INCIDENT_ROW_SENT, task: grayTask(path) }),
+    /the agent is gone/u,
+  )
 })

@@ -14,8 +14,8 @@
 
 ## 3. Turn адъюдикации (`lib/diverged.js`)
 
-- [ ] 3.1 Добавить `buildAdjudicationPrompt({change, previous, task})` с обеими формулировками и правилом «та же задача — выполни и отметь, другая — не трогай»; проверить: тест фиксирует текст, включая оба описания и требование паузы после задачи
-- [ ] 3.2 Добавить `runAdjudication({agent, change, previous, task, signal})`, возвращающий `ticked` / `untouched` / `cancelled` через `followup()` и `waitForIdle()`; проверить: `node --test test/diverged.test.mjs` покрывает отмеченную и неотмеченную задачу на фейковом файле и отмену по сигналу
+- [x] 3.1 Добавить `buildAdjudicationPrompt({change, previous, task})` с обеими формулировками и правилом «та же задача — выполни и отметь, другая — не трогай»; проверить: тест фиксирует текст, включая оба описания и требование паузы после задачи
+- [x] 3.2 Добавить `runAdjudication({agent, change, previous, task, signal})`, возвращающий `ticked` / `untouched` / `cancelled` через `followup()` и `waitForIdle()`; проверить: `node --test test/diverged.test.mjs` покрывает отмеченную и неотмеченную задачу на фейковом файле и отмену по сигналу
 
 ## 4. Вопрос пользователю при значительном расхождении
 
